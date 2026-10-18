@@ -1,9 +1,9 @@
-// song-info/client.mjs — 歌曲资料 v1.1
+// song-info/client.mjs — 歌曲资料 v2.0.0
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
-//   默认「百度百科」：抓取词条页面 meta description（未收录时回退维基百科）
+//   默认「公开检索」：按顺序检索公开来源，命中后停止继续请求
 //   「AI 检索」：把歌曲信息发给 OpenAI 兼容接口（DeepSeek 等），返回结构化资料
-// 查询结果按 歌曲+歌手 缓存到模组数据文件，再次打开秒出。
+// 仅在面板打开时查询；成功结果按歌曲+歌手缓存。
 const INFO_SVG =
   '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
   '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
@@ -12,9 +12,24 @@ const WIKI_ZH = "https://zh.wikipedia.org/w/api.php";
 const WIKI_EN = "https://en.wikipedia.org/w/api.php";
 const MB_API = "https://musicbrainz.org/ws/2/recording/?fmt=json&limit=3&query=";
 const BAKE = "https://baike.baidu.com/item/";
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
-const CACHE_KEY = "si-cache";
-const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 缓存有效期 30 天，超期自动重新查询保证时效
+const CACHE_KEY = "si-cache-v2";
+const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
+const API_KEY_STORAGE = "si-api-key";
+const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
+
+// 所有网络请求经同一队列串行发出，避免快速切歌造成并发请求洪峰。
+let networkTail = Promise.resolve();
+let lastNetworkStart = 0;
+function limitedFetch(folium, url, options) {
+  const run = networkTail.then(async () => {
+    const wait = Math.max(0, 450 - (Date.now() - lastNetworkStart));
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    lastNetworkStart = Date.now();
+    return folium.net.fetch(url, options || {});
+  });
+  networkTail = run.catch(() => {});
+  return run;
+}
 
 const enc = encodeURIComponent;
 const esc = (s) =>
@@ -102,14 +117,6 @@ function hasTrad(text) {
   return false;
 }
 
-// 检测是否含非简体中文（繁体或英文等其他文字）
-function needsTranslate(text) {
-  const t = String(text || "");
-  if (!t) return false;
-  if (hasTrad(t)) return true;
-  return /[A-Za-z]{3,}/.test(t);
-}
-
 // 语言目标规范化：Folia 的 locale → 翻译目标语言码
 function normTarget(locale) {
   const l = String(locale || "").toLowerCase();
@@ -149,7 +156,7 @@ function detectSrc(text) {
 // 公开检索模式的翻译：目标语言跟随软件语言（跟随系统时即系统语言）；
 // 繁体→简体 用内置映射离线转换（实际转换了才用）；其他组合调免费翻译接口（无需密钥）；
 // 源与目标相同或接口报错时回退原文，绝不把接口错误文本当翻译显示。
-async function translateForPublic(folium, text, target, keepOriginal) {
+async function translateForPublic(folium, text, target, keepOriginal, allowRemoteTranslation) {
   const orig = String(text || "").trim();
   if (!orig) return orig;
   const tgt = normTarget(target);
@@ -161,14 +168,14 @@ async function translateForPublic(folium, text, target, keepOriginal) {
     if (t2s !== orig) return keepOriginal ? orig + "\n（简体翻译：" + t2s + "）" : t2s;
   }
 
-  // 其他组合 → 免费翻译接口；源与目标相同则无翻译必要
+  // 其他语言翻译默认关闭；开启后最多发送 1800 字原文到 MyMemory。
   const src = detectSrc(orig);
-  if (src === tgt) return orig;
+  if (src === tgt || allowRemoteTranslation !== true) return orig;
   const pair = src + "|" + tgt;
   try {
-    const r = await folium.net.fetch(
+    const r = await limitedFetch(folium,
       "https://api.mymemory.translated.net/get?q=" + enc(orig.slice(0, 1800)) + "&langpair=" + enc(pair),
-      { headers: { "User-Agent": UA }, timeoutMs: 12000 }
+      { timeoutMs: 12000 }
     );
     if (r.ok) {
       const j = r.json();
@@ -216,15 +223,7 @@ const resolveAI = (cfg) => {
 async function baikeIntro(folium, title) {
   if (!title) return null;
   try {
-    const r = await folium.net.fetch(BAKE + enc(title), {
-      headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        Referer: "https://baike.baidu.com/",
-      },
-      timeoutMs: 20000,
-    });
+    const r = await limitedFetch(folium, BAKE + enc(title), { headers: { Accept: "text/html" }, timeoutMs: 20000 });
     if (!r.ok) return null;
     const html = r.text();
     const m = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i) ||
@@ -241,7 +240,7 @@ async function baikeIntro(folium, title) {
 async function wikiIntro(folium, title, api) {
   if (!title) return null;
   try {
-    const r = await folium.net.fetch(
+    const r = await limitedFetch(folium,
       api + "?action=query&format=json&prop=extracts&explaintext=1&exintro=1&redirects=1&titles=" + enc(title)
     );
     if (!r.ok) return null;
@@ -249,7 +248,7 @@ async function wikiIntro(folium, title, api) {
     const pages = (j.query && j.query.pages) || {};
     const page = Object.values(pages)[0];
     if (!page || page.missing) return null;
-    return page.extract || null;
+    return page.extract ? truncate(page.extract.replace(/\s+/g, " ").trim(), 650) : null;
   } catch (e) {
     folium.log.warn("wikiIntro failed", String((e && e.message) || e));
     return null;
@@ -262,10 +261,7 @@ async function mbRecording(folium, title, artist) {
   const clean = (s) => String(s || "").replace(/["\\]/g, " ").replace(/\s+/g, " ").trim();
   try {
     const q = 'recording:"' + clean(title) + '"' + (artist ? ' AND artist:"' + clean(artist) + '"' : "");
-    const r = await folium.net.fetch(MB_API + enc(q), {
-      headers: { "User-Agent": "FoliaSongInfo/1.1 (personal music mod)" },
-      timeoutMs: 20000,
-    });
+    const r = await limitedFetch(folium, MB_API + enc(q), { timeoutMs: 20000 });
     if (!r.ok) return null;
     const j = r.json();
     const rec = (j.recordings || [])[0];
@@ -285,15 +281,7 @@ async function mbRecording(folium, title, artist) {
 async function doubanIntro(folium, query) {
   if (!query) return null;
   try {
-    const r = await folium.net.fetch("https://www.douban.com/search?cat=1003&q=" + enc(query), {
-      headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        Referer: "https://www.douban.com/",
-      },
-      timeoutMs: 15000,
-    });
+    const r = await limitedFetch(folium, "https://www.douban.com/search?cat=1003&q=" + enc(query), { headers: { Accept: "text/html" }, timeoutMs: 15000 });
     if (!r.ok) return null;
     const html = r.text();
     const m = html.match(/<div class="result">[\s\S]*?<h3>[\s\S]*?<a[^>]*>([^<]*)<\/a>[\s\S]*?<span class="subject-cast">([^<]*)<\/span>[\s\S]*?<p>([\s\S]*?)<\/p>/);
@@ -313,9 +301,9 @@ async function doubanIntro(folium, query) {
 async function moegirlIntro(folium, title) {
   if (!title) return null;
   try {
-    const r = await folium.net.fetch(
+    const r = await limitedFetch(folium,
       "https://zh.moegirl.org.cn/api.php?action=query&prop=extracts&exintro&explaintext&format=json&titles=" + enc(title),
-      { headers: { "User-Agent": UA }, timeoutMs: 15000 }
+      { timeoutMs: 15000 }
     );
     if (!r.ok) return null;
     const j = r.json();
@@ -336,31 +324,26 @@ async function aggregateSearch(folium, artist, title, mb) {
   const queries = [];
   const push = (q) => {
     q = String(q || "").replace(/\s+/g, " ").trim();
-    if (q && queries.indexOf(q) < 0) queries.push(q);
+    if (q && !queries.includes(q)) queries.push(q);
   };
   push(title);
-  push(title && artist ? title + " " + artist : null);
-  push(artist);
-  if (mb) {
-    push(mb.album);
-    if (mb.year) push(mb.album + " " + mb.year);
+  if (title && artist) push(title + " " + artist);
+  if (mb && mb.album) push(mb.album);
+  // 最多两种查询词；任一数据源命中即停止，不再把同一首歌扩展成多路抓取。
+  for (const q of queries.slice(0, 2)) {
+    const sources = [
+      ["豆瓣音乐", () => doubanIntro(folium, q)],
+      ["萌娘百科", () => moegirlIntro(folium, q)],
+      ["维基百科（中文）", () => wikiIntro(folium, q, WIKI_ZH)],
+      ["维基百科（英文）", () => wikiIntro(folium, q, WIKI_EN)],
+      ["百度百科", () => baikeIntro(folium, q)],
+    ];
+    for (const [name, get] of sources) {
+      const value = await get();
+      if (value) return name + "（" + q + "）：" + truncate(value, 650);
+    }
   }
-  if (queries.length > 4) queries.length = 4;
-  const parts = [];
-  for (const q of queries) {
-    if (parts.length >= 10) break;
-    const d = await doubanIntro(folium, q);
-    if (d) parts.push("豆瓣（" + q + "）：" + d);
-    const m = await moegirlIntro(folium, q);
-    if (m) parts.push("萌娘百科（" + q + "）：" + m);
-    const w = await wikiIntro(folium, q, WIKI_ZH);
-    if (w) parts.push("维基百科（" + q + "）：" + w);
-    const we = await wikiIntro(folium, q, WIKI_EN);
-    if (we) parts.push("维基百科 EN（" + q + "）：" + we);
-    const b = await baikeIntro(folium, q);
-    if (b) parts.push("百度百科（" + q + "）：" + b);
-  }
-  return parts.join("\n");
+  return "";
 }
 
 // AI 检索：OpenAI 兼容 chat/completions。
@@ -371,7 +354,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   const base = String(ai.base || "").replace(/\/+$/, "");
   const model = String(ai.model || "");
   if (!base || !model || !cfg.apiKey) {
-    return { error: "请先在模组管理中选 AI 服务商预设（或填自定义接口/模型）并填 API 密钥" };
+    return { error: "请先配置 AI 服务商和模型，并在「AI API 密钥」设置中保存密钥" };
   }
 
   // ---- RAG：检索公开资料作为上下文（顺序：豆瓣音乐 → 萌娘百科 → 维基 zh/en → 百度百科）----
@@ -428,20 +411,20 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   const sys = hasCtx
     ? "你是音乐资料助手。下面提供【检索资料】片段（来自豆瓣音乐/萌娘百科/维基百科/百度百科，可能不完整或为空）。" +
       "回答规则：① 翻译规则是最重要的硬性要求：" + keepTxt +
-      "② 资料中明确的内容如实采用；资料没有或不全的字段（如主要荣誉、经历、歌曲内容、出处），用你自己的知识补充填写，禁止写\"检索资料未收录\"、\"未收录\"等占位字样；" +
+      "② 优先依据资料；资料未支持的细节不要编造，不确定的字段使用空字符串，并明确区分事实与推测；" +
       "③ 只输出一个 JSON 对象，不要输出其他内容，不要用 markdown 代码块。字段：{song:{album, year, origin, content}, artist:{name, bio, honors, career}}。" +
       "album 专辑名、year 发行年份、origin 歌曲出处背景（作词作曲、首发专辑/节目等）、content 歌曲内容介绍（主题、歌词大意、故事情节）；" +
       "bio 歌手简介一段、honors 主要荣誉、career 代表经历/代表作。全部字段都尽量填写，正文统一使用" + langName + "。"
     : "你是音乐资料助手。未检索到该歌手/歌曲的任何资料，请根据你自己的知识回答。" +
       "回答规则：① 翻译规则是最重要的硬性要求：" + keepTxt +
-      "② 尽量填写每个字段，不确定的写\"未知\"，禁止写\"检索资料未收录\"、\"未收录\"等占位字样；" +
+      "② 不要编造事实；不确定的字段使用空字符串，避免猜测性细节；" +
       "③ 只输出一个 JSON 对象，不要输出其他内容，不要用 markdown 代码块。字段：{song:{album, year, origin, content}, artist:{name, bio, honors, career}}。" +
       "album 专辑名、year 发行年份、origin 歌曲出处背景、content 歌曲内容介绍；bio 歌手简介一段、honors 主要荣誉、career 代表经历/代表作。正文统一使用" + langName + "为主。";
   const user =
     (hasCtx ? "【检索资料】\n" + ctx + "\n\n请根据以上资料整理" : "请整理") +
     ' 歌曲《' + title + '》 - 歌手：' + artist + ' 的资料并输出 JSON。';
   try {
-    const r = await folium.net.fetch(endpoint, {
+    const r = await limitedFetch(folium, endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -486,12 +469,12 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       if (looksTarget(s, tgt)) {
         // zh-CN 目标 + 繁体中文 → 转简体（确有转换才用）
         if (tgt === "zh-CN" && hasTrad(s)) {
-          const tr = await translateForPublic(folium, s, tgt, keepOriginal !== false);
-          return tr === s ? tr : tr;
+          const tr = await translateForPublic(folium, s, tgt, keepOriginal !== false, cfg.useMyMemory === true);
+          return tr;
         }
         return v;
       }
-      return await translateForPublic(folium, s, tgt, keepOriginal !== false);
+      return await translateForPublic(folium, s, tgt, keepOriginal !== false, cfg.useMyMemory === true);
     };
     if (obj && typeof obj === "object") {
       const song = obj.song || {};
@@ -509,7 +492,8 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
         career: await fix(art.career),
       };
     }
-    return { ai: obj, generatedByAi: !hasCtx || aggregated };
+    const sourceMatches = ctx.match(/豆瓣音乐|萌娘百科|维基百科(?: EN)?|百度百科|MusicBrainz/g) || [];
+    return { ai: obj, generatedByAi: !hasCtx, aiAggregated: !!hasCtx && aggregated, sources: [...new Set(sourceMatches)] };
   } catch (e) {
     folium.log.warn("aiLookup failed", String((e && e.message) || e));
     return { error: "AI 查询失败（网络或解析错误），请稍后重试" };
@@ -520,31 +504,40 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
 // 全部检索不到时若已配置 AI，则用 AI 兜底生成并标记 generatedByAi（界面显示告示）。
 // 翻译目标跟随软件语言（target），keepOriginal 控制是否保留原文。
 async function publicLookup(folium, artist, title, cfg, target, keepOriginal) {
-  const artistIntro =
-    (artist ? await doubanIntro(folium, artist) : null) ||
-    (artist ? await moegirlIntro(folium, artist) : null) ||
-    (artist ? await wikiIntro(folium, artist, WIKI_ZH) : null) ||
-    (artist ? await wikiIntro(folium, artist, WIKI_EN) : null) ||
-    (artist ? await baikeIntro(folium, artist) : null);
-  const songIntro =
-    (title ? await doubanIntro(folium, title) : null) ||
-    (title ? await moegirlIntro(folium, title) : null) ||
-    (title ? await wikiIntro(folium, title, WIKI_ZH) : null) ||
-    (title ? await wikiIntro(folium, title, WIKI_EN) : null) ||
-    (title ? await baikeIntro(folium, title) : null);
+  const findFirst = async (query) => {
+    if (!query) return { text: null, source: null };
+    const sources = [
+      ["豆瓣音乐", () => doubanIntro(folium, query)],
+      ["萌娘百科", () => moegirlIntro(folium, query)],
+      ["维基百科（中文）", () => wikiIntro(folium, query, WIKI_ZH)],
+      ["维基百科（英文）", () => wikiIntro(folium, query, WIKI_EN)],
+      ["百度百科", () => baikeIntro(folium, query)],
+    ];
+    for (const [source, get] of sources) {
+      const text = await get();
+      if (text) return { text, source };
+    }
+    return { text: null, source: null };
+  };
+  const artistResult = await findFirst(artist);
+  const songResult = await findFirst(title);
   const mb = title ? await mbRecording(folium, title, artist) : null;
-  // 公开模式翻译：目标语言跟随软件语言，非目标语言内容保留原文（或按开关只显示翻译）
-  const ai = artistIntro ? await translateForPublic(folium, artistIntro, target, keepOriginal) : null;
-  const si = songIntro ? await translateForPublic(folium, songIntro, target, keepOriginal) : null;
-  const empty = !ai && !si && !(mb && (mb.album || mb.year));
-  const hasAI = cfg && !!resolveAI(cfg).base && !!resolveAI(cfg).model && !!cfg.apiKey;
+  const artistIntro = artistResult.text ? await translateForPublic(folium, artistResult.text, target, keepOriginal, cfg && cfg.useMyMemory === true) : null;
+  const songIntro = songResult.text ? await translateForPublic(folium, songResult.text, target, keepOriginal, cfg && cfg.useMyMemory === true) : null;
+  const empty = !artistIntro && !songIntro && !(mb && (mb.album || mb.year));
+  const ai = resolveAI(cfg || {});
+  const hasAI = !!ai.base && !!ai.model && !!(cfg && cfg.apiKey);
   if (empty && hasAI) {
     const g = await aiLookup(folium, cfg, artist, title, target, keepOriginal);
-    if (g && g.ai && !g.error) {
-      return { artistIntro: null, songIntro: null, mb: null, ai: g.ai, error: null, generatedByAi: true };
-    }
+    if (g && g.ai && !g.error) return { artistIntro: null, songIntro: null, mb: null, ai: g.ai, error: null, generatedByAi: !!g.generatedByAi, aiAggregated: !!g.aiAggregated, sources: g.sources || [] };
+    if (g && g.error) return g;
   }
-  return { artistIntro: ai, songIntro: si, mb, ai: null, error: null, generatedByAi: false };
+  if (empty) return { error: "未找到相关资料。网络不可用或来源未收录时不会缓存失败结果。" };
+  return {
+    artistIntro, songIntro, mb, ai: null, error: null, generatedByAi: false,
+    artistSource: artistResult.source, songSource: songResult.source,
+    sources: [...new Set([artistResult.source, songResult.source, mb && "MusicBrainz"].filter(Boolean))],
+  };
 }
 
 // ---------- 缓存 ----------
@@ -561,7 +554,9 @@ async function loadCache(folium) {
 async function saveCache(folium, cache) {
   try {
     const keys = Object.keys(cache).sort((a, b) => (cache[a].ts || 0) - (cache[b].ts || 0));
-    while (keys.length > 300) {
+    const sizeEstimate = () => JSON.stringify(cache).length * 3; // UTF-8 保守估算
+    while (keys.length > 120 || sizeEstimate() > CACHE_MAX_BYTES) {
+      if (!keys.length) break;
       delete cache[keys.shift()];
     }
     await folium.storage.set(CACHE_KEY, cache);
@@ -573,23 +568,22 @@ async function saveCache(folium, cache) {
 const truncate = (s, n) => (s.length > n ? s.slice(0, n).replace(/\s+\S*$/, "") + "…" : s);
 
 const CSS_TEXT = `
-@keyframes siFade{from{opacity:0}to{opacity:1}}
-.si-root{color:var(--folium-primary,#e8e8ec);font-family:var(--folium-font,system-ui);min-width:0;}.si-body{display:flex;flex-direction:column;gap:10px;}
-.si-load{font-size:12px;opacity:.6;padding:16px 0;text-align:center;}
-.si-none{font-size:12px;opacity:.55;padding:10px 0;line-height:1.5;}
-.si-err{font-size:12px;color:#f87171;padding:10px 0;line-height:1.5;}
-.si-warn{font-size:11px;color:#fbbf24;background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.32);border-radius:8px;padding:7px 10px;line-height:1.5;}
-.si-head{border-bottom:1px solid rgba(128,128,128,.16);padding-bottom:8px;}
-.si-song{font-size:16px;font-weight:700;word-break:break-word;line-height:1.3;}
-.si-artist{font-size:12px;opacity:.65;margin-top:3px;word-break:break-word;line-height:1.4;}
-.si-src{font-size:10px;opacity:.45;margin-top:4px;}
-.si-meta{font-size:11px;opacity:.75;padding:6px 10px;background:rgba(128,128,128,.09);border-radius:8px;line-height:1.5;word-break:break-word;}
-.si-sec{background:rgba(128,128,128,.06);border:1px solid rgba(128,128,128,.13);border-radius:10px;padding:9px 11px;min-width:0;}
-.si-sec-t{font-size:11px;opacity:.55;font-weight:700;letter-spacing:.03em;margin-bottom:5px;}
-.si-sec-b{font-size:12px;line-height:1.6;word-break:break-word;}
-.si-foot{font-size:10px;opacity:.38;text-align:center;}
-.si-regen{margin-top:2px;align-self:center;border:1px solid rgba(139,92,246,.45);background:rgba(139,92,246,.14);color:inherit;border-radius:8px;padding:6px 16px;font-size:12px;cursor:pointer;}
-.si-regen:hover{background:rgba(139,92,246,.28);}
+.si-root{color:var(--folium-primary,#e8e8ec);font-family:var(--folium-font,system-ui);min-width:0;}.si-root .si-body{display:flex;flex-direction:column;gap:10px;}
+.si-root .si-load{font-size:12px;opacity:.6;padding:16px 0;text-align:center;}
+.si-root .si-none{font-size:12px;opacity:.55;padding:10px 0;line-height:1.5;}
+.si-root .si-err{font-size:12px;color:#f87171;padding:10px 0;line-height:1.5;}
+.si-root .si-warn{font-size:11px;color:#fbbf24;background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.32);border-radius:8px;padding:7px 10px;line-height:1.5;}
+.si-root .si-head{border-bottom:1px solid rgba(128,128,128,.16);padding-bottom:8px;}
+.si-root .si-song{font-size:16px;font-weight:700;word-break:break-word;line-height:1.3;}
+.si-root .si-artist{font-size:12px;opacity:.65;margin-top:3px;word-break:break-word;line-height:1.4;}
+.si-root .si-src{font-size:10px;opacity:.45;margin-top:4px;}
+.si-root .si-meta{font-size:11px;opacity:.75;padding:6px 10px;background:rgba(128,128,128,.09);border-radius:8px;line-height:1.5;word-break:break-word;}
+.si-root .si-sec{background:rgba(128,128,128,.06);border:1px solid rgba(128,128,128,.13);border-radius:10px;padding:9px 11px;min-width:0;}
+.si-root .si-sec-t{font-size:11px;opacity:.55;font-weight:700;letter-spacing:.03em;margin-bottom:5px;}
+.si-root .si-sec-b{font-size:12px;line-height:1.6;word-break:break-word;}
+.si-root .si-foot{font-size:10px;opacity:.38;text-align:center;}
+.si-root .si-regen{margin-top:2px;align-self:center;border:1px solid rgba(139,92,246,.45);background:rgba(139,92,246,.14);color:inherit;border-radius:8px;padding:6px 16px;font-size:12px;cursor:pointer;}
+.si-root .si-regen:hover{background:rgba(139,92,246,.28);}
 `;
 
 export default function activate(folium) {
@@ -598,120 +592,134 @@ export default function activate(folium) {
   // 当前软件 UI 语言（翻译目标跟随它；"跟随系统"时宿主 locale 即系统语言）
   let curLocale = "zh-CN";
 
-  // 模组管理中的设置：数据源 + AI 连接（预设服务商 / 自定义接口 / 模型 / 温度 / 密钥）+ 保留原文开关
+  // 普通设置只保存非敏感偏好；API 密钥单独存入 folium.storage，不进入视觉配置导入/导出。
   let cfgParams = null;
   try {
-    cfgParams = folium.registries.settingsSections.register({
+    const settingsHandle = folium.registries.settingsSections.register({
       id: "ai-config",
       label: { "zh-CN": "资料查询", en: "Info lookup" },
       description: {
-        "zh-CN": "资料获取顺序：豆瓣音乐 → 萌娘百科 → 维基百科 → 百度百科 → AI 聚合搜索 → AI 生成；缺失字段由 AI 直接补全。翻译目标跟随软件语言（跟随系统时即系统语言），保留原文可在下方开关关闭。AI 服务商兼容主流 OpenAI 兼容接口（DeepSeek/OpenAI/Kimi/智谱/通义/豆包/混元/本地 Ollama 等），选预设即自动带默认模型，也可选「自定义」手动填任意兼容地址。密钥只保存在本机模组数据文件，不进日志。",
-        en: "Source order: Douban Music → Moegirlpedia → Wikipedia → Baidu Baike → AI aggregate search → AI generation; missing fields are filled by AI. Translation target follows the app language; keep-original can be toggled below. AI provider supports mainstream OpenAI-compatible endpoints (DeepSeek/OpenAI/Kimi/Zhipu/Qwen/Doubao/Hunyuan/local Ollama…); presets fill the default model, or pick Custom and enter any compatible base URL. The key is stored locally only.",
+        "zh-CN": "公开检索按需查询豆瓣音乐、萌娘百科、维基百科、百度百科及 MusicBrainz；只有打开歌曲资料面板时才发起查询。AI 功能关闭时不会调用 AI。开启 MyMemory 翻译后，最多 1800 字资料原文（可能含歌名/歌手等内容）会发送给 api.mymemory.translated.net；默认关闭。AI 查询会把歌曲/歌手信息及检索到的资料发送到你选择的 AI 服务商，请只使用你信任的服务商。API 密钥在下方独立密钥设置中输入并保存在模组 folium.storage，不进入视觉配置导出；升级后请重新输入密钥。",
+        en: "Sources are queried on demand only while the Song Info panel is open. MyMemory translation is off by default; when enabled, up to 1,800 characters of source text may be sent to api.mymemory.translated.net. AI queries send song/artist details and retrieved excerpts to your selected provider. Store the API key in the separate secret panel; it is kept in this mod's folium.storage and is not included in visual-config exports. Re-enter the key after upgrading.",
       },
       settings: [
-        {
-          key: "source",
-          type: "select",
-          label: { "zh-CN": "数据源", en: "Source" },
-          defaultValue: "baike",
-          options: [
-            { value: "baike", label: { "zh-CN": "百度百科", en: "Baidu Baike" } },
-            { value: "ai", label: { "zh-CN": "AI 检索", en: "AI lookup" } },
-          ],
-        },
-        {
-          key: "aiPreset",
-          type: "select",
-          label: { "zh-CN": "AI 服务商", en: "AI provider" },
-          defaultValue: "custom",
-          options: [
-            { value: "deepseek", label: { "zh-CN": "DeepSeek 深度求索", en: "DeepSeek" } },
-            { value: "openai", label: { "zh-CN": "OpenAI（GPT）", en: "OpenAI (GPT)" } },
-            { value: "moonshot", label: { "zh-CN": "Kimi 月之暗面", en: "Kimi (Moonshot)" } },
-            { value: "zhipu", label: { "zh-CN": "智谱 GLM", en: "Zhipu GLM" } },
-            { value: "qwen", label: { "zh-CN": "通义千问（阿里）", en: "Qwen (Alibaba)" } },
-            { value: "doubao", label: { "zh-CN": "豆包（火山方舟）", en: "Doubao (Volcengine)" } },
-            { value: "hunyuan", label: { "zh-CN": "腾讯混元", en: "Tencent Hunyuan" } },
-            { value: "ollama", label: { "zh-CN": "Ollama（本地）", en: "Ollama (local)" } },
-            { value: "custom", label: { "zh-CN": "自定义（手动填接口/模型）", en: "Custom (manual)" } },
-          ],
-        },
-        {
-          key: "keepOriginal",
-          type: "boolean",
-          label: { "zh-CN": "保留原文", en: "Keep original" },
-          description: {
-            "zh-CN": "翻译时是否保留资料原文（保留：原文 + 翻译；关闭：只显示翻译）",
-            en: "Keep the original text beside the translation, or show translation only.",
-          },
-          defaultValue: true,
-        },
-        {
-          key: "aiBaseUrl",
-          type: "text",
-          label: { "zh-CN": "接口地址（自定义）", en: "API base URL (custom)" },
-          placeholder: "选预设后可留空；自定义填任意 OpenAI 兼容地址，如 https://api.deepseek.com",
-          defaultValue: "",
-        },
-        {
-          key: "aiModel",
-          type: "text",
-          label: { "zh-CN": "模型（自定义）", en: "Model (custom)" },
-          placeholder: "选预设已带默认模型；自定义时填模型名，如 deepseek-chat",
-          defaultValue: "",
-        },
+        { key: "source", type: "select", label: { "zh-CN": "数据源", en: "Source" }, defaultValue: "baike", options: [
+          { value: "baike", label: { "zh-CN": "公开检索", en: "Public lookup" } },
+          { value: "ai", label: { "zh-CN": "AI 检索", en: "AI lookup" } },
+        ]},
+        { key: "aiPreset", type: "select", label: { "zh-CN": "AI 服务商", en: "AI provider" }, defaultValue: "custom", options: [
+          { value: "deepseek", label: { "zh-CN": "DeepSeek 深度求索", en: "DeepSeek" } },
+          { value: "openai", label: { "zh-CN": "OpenAI（GPT）", en: "OpenAI (GPT)" } },
+          { value: "moonshot", label: { "zh-CN": "Kimi 月之暗面", en: "Kimi (Moonshot)" } },
+          { value: "zhipu", label: { "zh-CN": "智谱 GLM", en: "Zhipu GLM" } },
+          { value: "qwen", label: { "zh-CN": "通义千问（阿里）", en: "Qwen (Alibaba)" } },
+          { value: "doubao", label: { "zh-CN": "豆包（火山方舟）", en: "Doubao (Volcengine)" } },
+          { value: "hunyuan", label: { "zh-CN": "腾讯混元", en: "Tencent Hunyuan" } },
+          { value: "ollama", label: { "zh-CN": "Ollama（本地）", en: "Ollama (local)" } },
+          { value: "custom", label: { "zh-CN": "自定义（手动填接口/模型）", en: "Custom (manual)" } },
+        ]},
+        { key: "keepOriginal", type: "boolean", label: { "zh-CN": "保留原文", en: "Keep original" }, description: { "zh-CN": "翻译时同时显示原文与译文；关闭后只显示译文。", en: "Show source text alongside translation." }, defaultValue: true },
+        { key: "useMyMemory", type: "boolean", label: { "zh-CN": "启用 MyMemory 在线翻译（会发送资料文本）", en: "Enable MyMemory translation (sends source text)" }, description: { "zh-CN": "默认关闭。开启后，非简繁转换的资料文本最多 1800 字会发送至 MyMemory。", en: "Off by default. Up to 1,800 characters may be sent to MyMemory." }, defaultValue: false },
+        { key: "aiBaseUrl", type: "text", label: { "zh-CN": "接口地址（自定义）", en: "API base URL (custom)" }, placeholder: "选预设后可留空；自定义填 OpenAI 兼容地址", defaultValue: "" },
+        { key: "aiModel", type: "text", label: { "zh-CN": "模型（自定义）", en: "Model (custom)" }, placeholder: "选预设已带默认模型；自定义时填模型名", defaultValue: "" },
         { key: "aiTemperature", type: "number", label: { "zh-CN": "温度", en: "Temperature" }, defaultValue: 0.7, min: 0, max: 2, step: 0.1 },
-        { key: "apiKey", type: "text", label: { "zh-CN": "API 密钥", en: "API key" }, placeholder: "只保存在本机", defaultValue: "" },
       ],
-    }).params;
+    });
+    cfgParams = settingsHandle.settings;
   } catch (e) {
     folium.log.warn("settings register failed", String((e && e.message) || e));
   }
 
-  // ---- 预加载：换歌即后台查询资料并缓存（页签未打开也生效），打开页签直接命中缓存秒出 ----
-  const inflight = new Map(); // cacheKey -> Promise，避免重复查询
+  // 独立的密码输入面板；密钥只写入 folium.storage，输入框不回显已保存密钥。
+  try {
+    folium.registries.settingsSections.register({
+      id: "api-secret",
+      label: { "zh-CN": "AI API 密钥（本机保存）", en: "AI API key (local)" },
+      description: { "zh-CN": "密钥不在此处明文回显，也不会写入视觉配置。folium.storage 是本地存储，并非操作系统加密密钥库；请勿共享本机配置/数据文件。", en: "The key is not echoed or exported with visual settings. folium.storage is local storage, not an OS-encrypted keychain." },
+      settings: [],
+      settingsPanel: (container, ctx) => {
+        const wrap = document.createElement("div");
+        wrap.className = "si-secret-panel";
+        wrap.style.cssText = "display:flex;flex-direction:column;gap:8px;padding:8px 0;";
+        const input = document.createElement("input");
+        input.type = "password"; input.autocomplete = "new-password"; input.spellcheck = false;
+        input.placeholder = (ctx && ctx.locale || "").startsWith("en") ? "Paste API key, then Save" : "粘贴 API 密钥后点击保存";
+        input.style.cssText = "box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid var(--folium-border, #777);border-radius:8px;background:var(--folium-surface, transparent);color:inherit;";
+        const status = document.createElement("div"); status.style.cssText = "font-size:12px;opacity:.7;";
+        const buttons = document.createElement("div"); buttons.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
+        const makeButton = (label) => { const b = document.createElement("button"); b.type = "button"; b.textContent = label; b.style.cssText = "padding:6px 12px;border:1px solid var(--folium-border, #777);border-radius:7px;background:transparent;color:inherit;cursor:pointer;"; return b; };
+        const save = makeButton((ctx && ctx.locale || "").startsWith("en") ? "Save key" : "保存密钥");
+        const clear = makeButton((ctx && ctx.locale || "").startsWith("en") ? "Delete key" : "删除密钥");
+        save.addEventListener("click", async () => {
+          const key = input.value.trim();
+          if (!key) { status.textContent = "请先输入密钥；留空不会覆盖现有密钥。"; return; }
+          try { await folium.storage.set(API_KEY_STORAGE, key); input.value = ""; status.textContent = "密钥已保存到本机模组存储（不会回显）。"; }
+          catch (e) { status.textContent = "保存失败，请检查模组存储权限。"; folium.log.warn("API key save failed", String((e && e.message) || e)); }
+        });
+        clear.addEventListener("click", async () => {
+          try { await folium.storage.delete(API_KEY_STORAGE); input.value = ""; status.textContent = "已删除本机保存的密钥。"; }
+          catch (e) { status.textContent = "删除失败。"; folium.log.warn("API key delete failed", String((e && e.message) || e)); }
+        });
+        buttons.append(save, clear); wrap.append(input, buttons, status); container.appendChild(wrap);
+        return () => wrap.remove();
+      },
+    });
+  } catch (e) { folium.log.warn("secret settings register failed", String((e && e.message) || e)); }
+
+  // 不再随切歌后台预加载；只在用户打开歌曲资料面板时查询。
+  const inflight = new Map(); // 同一歌曲只保留一个查询任务
+  const getApiKey = async () => {
+    try { return String((await folium.storage.get(API_KEY_STORAGE)) || ""); }
+    catch (e) { folium.log.warn("API key read failed", String((e && e.message) || e)); return ""; }
+  };
+  let cacheMigrationPromise = null;
+  const migrateLegacyCache = () => {
+    if (!cacheMigrationPromise) cacheMigrationPromise = (async () => {
+      try {
+        const legacy = await folium.storage.get("si-cache");
+        if (legacy && typeof legacy === "object") {
+          const current = await loadCache(folium);
+          for (const [key, entry] of Object.entries(legacy)) {
+            const d = entry && entry.data;
+            const useful = d && !d.error && (d.ai || d.artistIntro || d.songIntro || (d.mb && (d.mb.album || d.mb.year)));
+            if (useful && !current[key]) current[key] = entry;
+          }
+          await saveCache(folium, current);
+          // 旧缓存可能含未截断的长正文；迁移后删除旧键，避免占用 1 MB storage 配额。
+          await folium.storage.delete("si-cache");
+        }
+      } catch (e) { folium.log.warn("legacy cache migration failed", String((e && e.message) || e)); }
+    })();
+    return cacheMigrationPromise;
+  };
   const lookupAndCache = async (cfg, artist, title, source, force) => {
     const cacheKey = source + "\u0001" + artist + "\u0001" + title;
     if (!force && inflight.has(cacheKey)) return inflight.get(cacheKey);
     const p = (async () => {
+      await migrateLegacyCache();
       const cache = await loadCache(folium);
       const hit = cache[cacheKey];
-      if (!force && hit && hit.data && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+      const usefulHit = hit && hit.data && !hit.data.error && (hit.data.ai || hit.data.artistIntro || hit.data.songIntro || (hit.data.mb && (hit.data.mb.album || hit.data.mb.year)));
+      if (!force && usefulHit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+      const effectiveCfg = { ...(cfg || {}), apiKey: await getApiKey() };
       let data = null;
-      if (cfg.source === "ai") {
-        data = await aiLookup(folium, cfg, artist, title, curLocale, cfg.keepOriginal);
-      } else {
-        data = await publicLookup(folium, artist, title, cfg, curLocale, cfg.keepOriginal);
-      }
+      if (effectiveCfg.source === "ai") data = await aiLookup(folium, effectiveCfg, artist, title, curLocale, effectiveCfg.keepOriginal);
+      else data = await publicLookup(folium, artist, title, effectiveCfg, curLocale, effectiveCfg.keepOriginal);
       if (data && !data.error) {
         cache[cacheKey] = { ts: Date.now(), data, source };
         await saveCache(folium, cache);
       }
       return data;
-    })()
-      .catch((e) => {
-        folium.log.warn("lookup failed", String((e && e.message) || e));
-        return null;
-      })
-      .finally(() => inflight.delete(cacheKey));
+    })().catch((e) => {
+      folium.log.warn("lookup failed", String((e && e.message) || e));
+      return { error: "查询失败，请检查网络连接后重试。失败结果不会缓存。" };
+    }).finally(() => inflight.delete(cacheKey));
     inflight.set(cacheKey, p);
     return p;
   };
 
-  const preload = async () => {
-    try {
-      const st = folium.playback.getState();
-      const song = st && st.song;
-      if (!song) return;
-      const cfg = cfgParams ? cfgParams.get() : { source: "baike" };
-      await lookupAndCache(cfg, song.artist || "", song.title || "", cfg.source || "baike", false);
-    } catch (e) {}
-  };
-  const preloadOff = folium.events.on("playback.songChanged", preload);
-  preload(); // 启动时已有播放歌曲也预加载
-
   // 播放页进度条右侧的信息按钮
-  folium.registries.controlButtons.register({
+  folium.registries.progressButtons.register({
     id: "song-info-btn",
     slot: "progress.trailing",
     order: 400,
@@ -840,9 +848,11 @@ export default function activate(folium) {
 
         const cache = await loadCache(folium);
         const hit = cache[cacheKey];
-        if (!force && hit && hit.data && Date.now() - hit.ts < CACHE_TTL) {
-          // 预加载命中（未过期）：资料直接淡入（先隐藏 → 高度过渡 → 淡入）
-          applyContent(renderCard(song, hit.data, hit.source || cfg.source || "baike"));
+        const usefulCachedData = hit && hit.data && !hit.data.error &&
+          (hit.data.ai || hit.data.artistIntro || hit.data.songIntro || (hit.data.mb && (hit.data.mb.album || hit.data.mb.year)));
+        if (!force && usefulCachedData && Date.now() - hit.ts < CACHE_TTL) {
+          // 有效且未过期的缓存直接显示；错误/空结果一律重新查询，不作为缓存命中。
+          applyContent(renderCard(song, hit.data, hit.source || cfg.source || "baike", true));
           bindRegen();
           return;
         }
@@ -851,7 +861,7 @@ export default function activate(folium) {
         applyContent('<div class="si-load">正在查询资料…</div>');
         const data = await lookupAndCache(cfg, artist, title, cfg.source || "baike", !!force);
         if (curKey !== key) return; // 查询期间已换歌，丢弃结果
-        applyContent(renderCard(song, data, cfg.source || "baike"));
+        applyContent(renderCard(song, data, cfg.source || "baike", false));
         bindRegen();
       };
 
@@ -870,22 +880,22 @@ export default function activate(folium) {
       };
 
       const regenBtn = '<button type="button" class="si-regen">重新生成</button>';
-      const renderCard = (song, data, source) => {
-        const srcLabel = source === "ai" || (data && data.generatedByAi) ? "AI 生成" : "百度百科";
+      const renderCard = (song, data, source, fromCache) => {
+        const srcLabel = source === "ai" || (data && data.ai) ? (data && data.generatedByAi ? (data.aiAggregated ? "AI 聚合搜索生成" : "AI 生成，未经检索") : "AI 整理") : ((data && data.sources && data.sources.length) ? data.sources.join("、") : "公开检索");
         let html =
           '<div class="si-head">' +
           '<div class="si-song">' + esc(song.title) + '</div>' +
           '<div class="si-artist">' + esc(song.artist || "未知歌手") + "</div>" +
-          '<div class="si-src">来源：' + srcLabel + " · 已缓存，下次秒开</div></div>";
+          '<div class="si-src">来源：' + esc(srcLabel) + (fromCache ? " · 已缓存" : "") + "</div></div>";
 
         if (data && data.generatedByAi) {
-          html += '<div class="si-warn">资料库未收录，以下内容由 AI 聚合搜索生成，仅供参考</div>';
+          html += data.aiAggregated ? '<div class="si-warn">AI 参考了公开检索结果并生成内容，请核对准确性。</div>' : '<div class="si-warn">AI 生成，未经检索；内容可能不准确，请自行核实。</div>';
         }
 
         if (!data) {
           html += '<div class="si-none">未找到相关资料</div>';
           html += regenBtn;
-          html += '<div class="si-foot">资料来自豆瓣音乐 · 百度百科 · 萌娘百科 · 维基百科 · MusicBrainz</div>';
+          html += '<div class="si-foot">来源：' + esc((data && data.sources || []).join(' · ') || '无可用来源') + '。维基百科与萌娘百科内容遵循各自页面所示许可协议。</div>';
           return html;
         }
         if (data.error) {
@@ -920,14 +930,14 @@ export default function activate(folium) {
           if (origin) html += '<div class="si-sec"><div class="si-sec-t">歌曲出处</div><div class="si-sec-b">' + esc(origin) + "</div></div>";
           if (!bio && !honors && !career && !origin && !content) html += '<div class="si-none">AI 未返回有效内容，可点「重新生成」重试</div>';
           html += regenBtn;
-          html += '<div class="si-foot">' + (data.generatedByAi ? "资料库未收录，以下内容由 AI 聚合搜索生成，仅供参考" : "AI 生成内容仅供参考，资料来自豆瓣音乐 · 萌娘百科 · 维基百科 · 百度百科 · MusicBrainz") + '</div>';
+          html += '<div class="si-foot">' + (data.generatedByAi ? (data.aiAggregated ? "AI 聚合搜索生成，仅供参考" : "AI 生成，未经检索；请核实准确性") : "AI 整理内容仅供参考；来源：" + esc((data.sources || []).join(' · ') || 'AI 服务商')) + '</div>';
           return html;
         }
 
         // 公开源结果
         const meta = [];
         if (data.mb && data.mb.album) meta.push("专辑 " + esc(data.mb.album));
-        if (data.mb && data.mb.year) meta.push(data.mb.year + " 年");
+        if (data.mb && data.mb.year) meta.push(esc(data.mb.year) + " 年");
         if (song.album) meta.push("唱片 " + esc(song.album));
         if (song.source) meta.push(esc(song.source === "local" ? "本地" : song.source));
         if (meta.length) html += '<div class="si-meta">' + meta.join(" · ") + "</div>";
@@ -936,10 +946,10 @@ export default function activate(folium) {
         if (data.songIntro) html +=
           '<div class="si-sec"><div class="si-sec-t">歌曲介绍</div><div class="si-sec-b">' + esc(truncate(data.songIntro, 600)) + "</div></div>";
         if (!data.artistIntro && !data.songIntro && !(data.mb && (data.mb.album || data.mb.year))) {
-          html += '<div class="si-none">未找到相关资料（已查豆瓣音乐 / 百度百科 / 萌娘百科 / 维基百科 / MusicBrainz）</div>';
+          html += '<div class="si-none">未找到相关资料；失败结果不会缓存，可点击重新生成重试</div>';
         }
         html += regenBtn;
-        html += '<div class="si-foot">资料来自豆瓣音乐 · 百度百科 · 萌娘百科 · 维基百科 · MusicBrainz</div>';
+        html += '<div class="si-foot">来源：' + esc((data.sources || []).join(' · ') || '无可用来源') + '。维基百科与萌娘百科内容遵循各自页面所示许可协议。</div>';
         return html;
       };
 
@@ -957,6 +967,5 @@ export default function activate(folium) {
   });
 
   return () => {
-    preloadOff();
   };
 }
