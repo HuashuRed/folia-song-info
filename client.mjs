@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.2.0（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.3.0（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.2.0 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.3.0 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -386,7 +386,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   // ---- RAG：按简洁/标准/详细挡位控制实际来源请求数 ----
   let ctx = "";
   let aggregated = false;
-  const detailMode = String(cfg.contentDetail || "balanced");
+  const detailMode = "detailed"; // AI 检索固定使用详细挡位（2.3.0：不再提供简洁/标准）
   try {
     const parts = [];
     const allSources = [
@@ -781,7 +781,7 @@ export default function activate(folium) {
     { key: "showCredits", type: "boolean", label: { "zh-CN": "显示创作人员", en: "Show credits" }, defaultValue: true },
     { key: "showListeningNotes", type: "boolean", label: { "zh-CN": "显示聆听提示（AI 解读）", en: "Show listening notes (AI interpretation)" }, defaultValue: true },
     { key: "showArtistDetails", type: "boolean", label: { "zh-CN": "显示歌手经历与荣誉", en: "Show artist career and honors" }, defaultValue: true },
-    { key: "autoAiMemorySupplement", type: "boolean", label: { "zh-CN": "自动 AI 记忆补充", en: "Auto AI memory supplement" }, description: { "zh-CN": "开启后，AI 查询结果若缺少歌曲/歌手栏目，会自动调用 AI 记忆补充并缓存结果，无需手动点击；生成内容会标注【ai 生成】，可能增加 AI 调用次数和费用。", en: "When enabled, missing song/artist sections trigger an AI-memory completion and cache automatically. Generated text is marked and may incur extra AI usage costs." }, defaultValue: false },
+    { key: "autoAiMemorySupplement", type: "boolean", label: { "zh-CN": "自动 AI 记忆补充", en: "Auto AI memory supplement" }, description: { "zh-CN": "开启后，AI 查询结果若缺少歌曲/歌手栏目，会自动调用 AI 记忆补充并缓存结果，无需手动点击；补充内容来自模型自身知识、未经检索核实（说明见模组介绍），可能增加 AI 调用次数和费用。", en: "When enabled, missing song/artist sections trigger an AI-memory completion and cache automatically. Supplemented text comes from the model's own knowledge (unverified); may incur extra AI usage costs." }, defaultValue: false },
     { key: "preloadNext", type: "boolean", label: { "zh-CN": "预加载播放列表下一首（AI 检索）", en: "Preload next playlist track (AI lookup)" }, description: { "zh-CN": "开启后，歌曲切换时会尝试提前查询下一首歌曲并缓存结果；仅在数据源为 AI 检索且能从播放状态识别下一首时生效，可能提前向 AI 服务商发送歌曲信息并产生费用。", en: "When enabled, attempts to fetch and cache the next playlist track when the song changes. Only works for AI lookup when the next track can be identified; may send track details to your AI provider and incur costs." }, defaultValue: false },
     { key: "keepOriginal", type: "boolean", label: { "zh-CN": "保留原文", en: "Keep original" }, description: { "zh-CN": "开启时同时显示原文与译文；关闭时只显示译文。仅作用于公开检索到的真实资料；AI 检索始终只显示软件使用语言，此开关在 AI 检索模式下不可用。", en: "Show source text alongside translation for public-lookup results only. AI lookup always shows only the UI language; this switch is disabled in AI mode." }, defaultValue: true },
     { key: "useMyMemory", type: "boolean", label: { "zh-CN": "启用 MyMemory 在线翻译（会发送资料文本）", en: "Enable MyMemory translation (sends source text)" }, description: { "zh-CN": "默认关闭。开启后，非简繁转换的资料文本最多 1800 字会发送至 MyMemory。", en: "Off by default. Up to 1,800 characters may be sent to MyMemory." }, defaultValue: false },
@@ -835,7 +835,7 @@ export default function activate(folium) {
       id: "ai-config",
       label: { "zh-CN": "资料查询", en: "Info lookup" },
       description: {
-        "zh-CN": "公开检索：豆瓣音乐、萌娘百科、百度百科、MusicBrainz 四个来源同时查询，按返回速度取用（简洁取第 1 个、标准取前 2 个、详细取全部 4 个有效来源），维基不参与公开检索。AI 检索：豆瓣、萌娘、维基（中/英）、百度、MusicBrainz，公开片段最多等 6 秒。只有打开歌曲资料面板时才发起查询。AI 功能关闭时不会调用 AI。开启 MyMemory 翻译后，最多 1800 字资料原文（可能含歌名/歌手等内容）会发送给 api.mymemory.translated.net；默认关闭。AI 查询会把歌曲/歌手信息及检索到的资料发送到你选择的 AI 服务商，请只使用你信任的服务商。API 密钥单独保存在本机模组存储，不进入视觉配置导出。",
+        "zh-CN": "公开检索：豆瓣音乐、萌娘百科、百度百科、MusicBrainz 四个来源同时查询，按返回速度取用（简洁取第 1 个、标准取前 2 个、详细取全部 4 个有效来源），维基不参与公开检索。AI 检索固定使用「详细」挡位：豆瓣、萌娘、维基（中/英）、百度、MusicBrainz，公开片段最多等 6 秒。只有打开歌曲资料面板时才发起查询。AI 功能关闭时不会调用 AI。开启 MyMemory 翻译后，最多 1800 字资料原文（可能含歌名/歌手等内容）会发送给 api.mymemory.translated.net；默认关闭。AI 查询会把歌曲/歌手信息及检索到的资料发送到你选择的 AI 服务商，请只使用你信任的服务商。API 密钥单独保存在本机模组存储，不进入视觉配置导出。",
         en: "Sources are queried on demand only while the Song Info panel is open. MyMemory translation is off by default; when enabled, up to 1,800 characters of source text may be sent to api.mymemory.translated.net. AI queries send song/artist details and retrieved excerpts to your selected provider. The API key is stored separately in local mod storage and excluded from visual-config exports."
       },
       settings: settingsSchema,
@@ -849,7 +849,47 @@ export default function activate(folium) {
         const controls = new Map();
         const getValues = () => getCfg();
         const writeValue = (key, value) => writeCfg(key, value);
+
+        // 顶部分组标签：公开检索 / AI 检索（类似浏览器标签，点击即切换数据源）
+        const tabs = document.createElement("div");
+        tabs.style.cssText = "display:flex;gap:6px;margin-bottom:2px;";
+        const switchTab = (src) => {
+          const isPublic = String(src || "baike") === "baike";
+          groupPublic.style.display = isPublic ? "" : "none";
+          groupAI.style.display = isPublic ? "none" : "";
+          tabPublic.style.fontWeight = isPublic ? "600" : "";
+          tabPublic.style.boxShadow = isPublic ? "inset 0 0 0 1px var(--folium-primary,rgba(120,140,180,.65))" : "";
+          tabAI.style.fontWeight = isPublic ? "" : "600";
+          tabAI.style.boxShadow = isPublic ? "" : "inset 0 0 0 1px var(--folium-primary,rgba(120,140,180,.65))";
+        };
+        const makeTab = (key, text) => {
+          const t = document.createElement("button");
+          t.type = "button";
+          t.textContent = text;
+          t.style.cssText = "flex:1;padding:8px 10px;font-size:13px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:transparent;color:inherit;cursor:pointer;";
+          t.addEventListener("click", () => { writeValue("source", key); switchTab(key); });
+          return t;
+        };
+        const tabPublic = makeTab("baike", en ? "Public search" : "公开检索");
+        const tabAI = makeTab("ai", en ? "AI search" : "AI 检索");
+        tabs.append(tabPublic, tabAI);
+        wrap.appendChild(tabs);
+
+        // 分组容器：公开检索 / AI 检索 独有项 + 两 tab 共通的底部公共区
+        const groupPublic = document.createElement("div");
+        groupPublic.style.cssText = "display:flex;flex-direction:column;gap:12px;";
+        const groupAI = document.createElement("div");
+        groupAI.style.cssText = "display:flex;flex-direction:column;gap:12px;";
+        const groupCommon = document.createElement("div");
+        groupCommon.style.cssText = "display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:12px;";
+        // AI 检索固定使用「详细」挡位：不再提供内容长度选项（简洁/标准已移除）
+        const PUBLIC_KEYS = ["contentDetail", "keepOriginal"];
+        const AI_KEYS = ["aiPreset", "aiBaseUrl", "aiModel", "aiTemperature", "preloadNext", "autoAiMemorySupplement"];
+        const COMMON_KEYS = ["useMyMemory", "showCredits", "showListeningNotes", "showArtistDetails"];
+        const GROUP_OF = (key) => PUBLIC_KEYS.includes(key) ? groupPublic : AI_KEYS.includes(key) ? groupAI : groupCommon;
+
         for (const def of settingsSchema) {
+          if (def.key === "source") continue; // 数据源由顶部标签代替
           const row = document.createElement("label");
           row.style.cssText = "display:flex;flex-direction:column;gap:5px;font-size:13px;color:inherit;";
           const title = document.createElement("span");
@@ -908,23 +948,23 @@ export default function activate(folium) {
           }
           controls.set(def.key, { input, type: def.type });
           if (def.type !== "boolean") row.appendChild(input);
-          wrap.appendChild(row);
+          GROUP_OF(def.key).appendChild(row);
         }
         const keyTitle = document.createElement("div");
         keyTitle.textContent = en ? "AI API key (stored locally)" : "AI API 密钥（本机保存）";
         keyTitle.style.cssText = "font-size:13px;font-weight:600;margin-top:8px;";
-        wrap.appendChild(keyTitle);
+        groupAI.appendChild(keyTitle);
         const keyHelp = document.createElement("small");
         keyHelp.textContent = en ? "Not included in visual-config exports. Local storage is not an OS-encrypted keychain." : "密钥不会写入视觉配置导出；本地存储并非操作系统加密密钥库。";
         keyHelp.style.cssText = "opacity:.65;line-height:1.4;";
-        wrap.appendChild(keyHelp);
+        groupAI.appendChild(keyHelp);
         const input = document.createElement("input");
         input.type = "password";
         input.autocomplete = "new-password";
         input.spellcheck = false;
         input.placeholder = en ? "Paste API key, then Save" : "粘贴 API 密钥后点击保存";
         input.style.cssText = "box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid var(--folium-border,#777);border-radius:8px;background:var(--folium-surface,transparent);color:inherit;";
-        wrap.appendChild(input);
+        groupAI.appendChild(input);
         const buttons = document.createElement("div");
         buttons.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
         const makeButton = (text) => {
@@ -964,45 +1004,27 @@ export default function activate(folium) {
           }
         });
         buttons.append(save, clear);
-        wrap.append(buttons, status);
+        groupAI.append(buttons, status);
+        // AI 检索固定「详细」的说明（内容长度选项已不在 AI tab 提供）
+        const aiFixedNote = document.createElement("small");
+        aiFixedNote.textContent = en ? "AI lookup always uses the Detailed level; the content-length option applies to public search only." : "AI 检索固定使用「详细」挡位；内容长度选项仅用于公开检索。";
+        aiFixedNote.style.cssText = "opacity:.65;line-height:1.4;";
+        groupAI.appendChild(aiFixedNote);
+        wrap.append(groupPublic, groupAI, groupCommon);
         container.appendChild(wrap);
 
-        const sourceCtrl = controls.get("source");
-        const AI_KEYS = ["aiPreset", "aiBaseUrl", "aiModel", "aiTemperature", "autoAiMemorySupplement", "preloadNext"];
-        const applyDisable = () => {
-          const values = getValues();
-          const curSrc = (sourceCtrl && sourceCtrl.input && sourceCtrl.input.value) || values.source || "baike";
-          const isPublic = String(curSrc) === "baike";
-          for (const [k, item] of controls) {
-            if (!AI_KEYS.includes(k)) continue;
-            item.input.disabled = isPublic;
-            item.input.style.opacity = isPublic ? ".45" : "";
-          }
-          // 保留原文只针对公开检索真实资料：AI 检索模式下禁用该开关
-          const keepItem = controls.get("keepOriginal");
-          if (keepItem && keepItem.input) {
-            keepItem.input.disabled = !isPublic;
-            keepItem.input.style.opacity = isPublic ? "" : ".45";
-          }
-          input.disabled = isPublic;
-          save.disabled = isPublic;
-          clear.disabled = isPublic;
-          input.style.opacity = isPublic ? ".45" : "";
-          keyTitle.style.opacity = isPublic ? ".45" : "";
-          keyHelp.style.opacity = isPublic ? ".45" : "";
-        };
-        const refresh = async () => {
+        const refresh = () => {
           const values = getValues();
           for (const def of settingsSchema) {
+            if (def.key === "source") continue;
             const item = controls.get(def.key);
             if (!item) continue;
             const value = values[def.key] ?? def.defaultValue;
             if (item.type === "boolean") item.input.checked = Boolean(value);
             else item.input.value = value == null ? "" : String(value);
           }
-          applyDisable();
+          switchTab(values.source || "baike");
         };
-        if (sourceCtrl) sourceCtrl.input.addEventListener("change", applyDisable);
         refresh();
         // 存储加载完成后刷新一次控件（避免持久化旧值未加载时被默认值顶替）
         ensureSettingsLoaded().then(() => { if (wrap.isConnected) refresh(); }).catch(() => {});
@@ -1082,7 +1104,7 @@ export default function activate(folium) {
   const preloadNextTrack = async () => {
     try {
       const cfg = getCfg();
-      if (!cfg.preloadNext || cfg.source !== "ai") {
+      if (!cfg.preloadNext || String(cfg.source || "baike") !== "ai") {
         logDiag(folium, "preload skip: preloadNext=" + !!cfg.preloadNext + " source=" + cfg.source);
         return;
       }
@@ -1096,7 +1118,9 @@ export default function activate(folium) {
       if (key === preloadLastKey) return;
       preloadLastKey = key;
       logDiag(folium, "preload next: " + artist + " - " + title);
-      const result = await lookupAndCache(cfg, artist, title, "ai", false);
+      // 预加载 = 完整的 AI 检索（固定详细挡位），与面板打开时的 AI 查询一致
+      const preCfg = { ...cfg, source: "ai", aiMemoryOnly: false, contentDetail: "detailed" };
+      const result = await lookupAndCache(preCfg, artist, title, "ai", false);
       if (result && result.error) folium.log.warn("next-track preload failed", result.error);
     } catch (e) { folium.log.warn("next-track preload failed", String((e && e.message) || e)); }
   };
@@ -1284,6 +1308,7 @@ export default function activate(folium) {
         curKey = key;
 
         const cfg = getCfg();
+        logDiag(folium, "render: source=" + cfg.source + " autoMem=" + !!cfg.autoAiMemorySupplement + " preload=" + !!cfg.preloadNext + " detail=" + cfg.contentDetail);
         const artist = song.artist || "";
         const title = song.title || "";
         const cacheKey = buildCacheKey(cfg.source || "baike", artist, title, cfg, curLocale);
@@ -1298,9 +1323,11 @@ export default function activate(folium) {
           (hit.data.ai || hit.data.artistIntro || hit.data.songIntro || (hit.data.mb && (hit.data.mb.album || hit.data.mb.year || hit.data.mb.releaseDate)));
         if (!force && usefulCachedData && Date.now() - hit.ts < CACHE_TTL) {
           if (autoEnabled && missingSections(hit.data)) {
-            applyContent('<div class="si-load">正在查询资料…</div>');
+            applyContent('<div class="si-load">正在自动补充资料…</div>');
+            logDiag(folium, "auto supplement: cache-hit missing sections -> run for " + artist + " - " + title);
             const mem = await runMemorySupplement(artist, title, hit.data);
             if (disposed || curKey !== key) return;
+            logDiag(folium, "auto supplement done: ok=" + mem.ok + (mem.error ? " err=" + mem.error : ""));
             applyContent(renderCard(song, mem.ok ? mem.data : hit.data, cfg.source || "ai", true));
             bindRegen(); bindMemorySupplement();
             return;
@@ -1318,9 +1345,15 @@ export default function activate(folium) {
         if (disposed || curKey !== key) return;
         let finalData = data;
         if (autoEnabled && data && data.ai) {
+          logDiag(folium, "auto supplement: parallel with main lookup for " + artist + " - " + title);
           const mem = await runMemorySupplement(artist, title, data, memP);
           if (disposed || curKey !== key) return;
-          if (mem.ok) finalData = mem.data;
+          if (mem.ok) {
+            finalData = mem.data;
+            logDiag(folium, "auto supplement merged into result");
+          } else {
+            logDiag(folium, "auto supplement skipped: " + (mem.error || "no ai data"));
+          }
         }
         if (disposed || curKey !== key) return;
         applyContent(renderCard(song, finalData, cfg.source || "baike", false));
@@ -1384,7 +1417,8 @@ export default function activate(folium) {
         const aiDisabled = String(cfgNow.source || "baike") !== "ai" && !(data && data.ai);
         const srcLabel = source === "ai" || (data && data.ai) ? (data && data.generatedByAi ? (data.aiAggregated ? "AI 参考检索生成" : "AI 生成，未经检索") : "AI 整理") : ((data && data.sources && data.sources.length) ? data.sources.join("、") : "公开检索");
         const sourceQuery = String(song.title || "") + (song.artist ? " " + song.artist : "");
-        const detailMode = getCfg().contentDetail || "balanced";
+        // AI 数据固定按「详细」显示；公开检索按设置的内容长度挡位
+        const detailMode = (data && data.ai) ? "detailed" : (getCfg().contentDetail || "balanced");
         const textLimit = detailMode === "compact" ? 260 : detailMode === "detailed" ? 1200 : 600;
         const section = (title, value, limit) => value ? '<div class="si-sec"><div class="si-sec-t">' + esc(title) + '</div><div class="si-sec-b">' + esc(truncate(String(value), limit || textLimit)) + '</div></div>' : "";
         let html =
