@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.1.0（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.1.1（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：按顺序检索公开来源，命中后停止继续请求
@@ -16,6 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
+const MB_USER_AGENT = "Folium-SongInfo/2.1.1 (https://github.com/folium-mods/song-info)";
 
 // 所有网络请求经同一队列串行发出，避免快速切歌造成并发请求洪峰。
 // 网络请求不再全局串行排队：AI 检索会并发访问有限数量的公开来源，避免逐个等待累积延迟。
@@ -96,6 +97,9 @@ const T2S = {
   "麻": "麻",
 };
 
+// 清理同字映射（如"新":"新"），避免 hasTrad 把简体误判为繁体。
+for (const k of Object.keys(T2S)) if (T2S[k] === k) delete T2S[k];
+
 // 繁体 → 简体（离线）
 function tw2s(text) {
   let out = "";
@@ -103,9 +107,9 @@ function tw2s(text) {
   return out;
 }
 
-// 检测是否含繁体字（离线映射命中）
+// 检测是否含繁体字（离线映射命中，且确认字符确实不同）
 function hasTrad(text) {
-  for (const ch of String(text || "")) if (T2S[ch]) return true;
+  for (const ch of String(text || "")) if (T2S[ch] && T2S[ch] !== ch) return true;
   return false;
 }
 
@@ -120,26 +124,34 @@ function normTarget(locale) {
   return l.slice(0, 2);
 }
 
+// 显式支持的目标语言集合；未知目标交给翻译流程决定，避免宽松误判。
+const SUPPORTED_TARGETS = new Set(["zh-CN", "zh-TW", "en", "ja", "ko", "id"]);
+
 // 文本是否已是目标语言
 function isTargetLang(text, target) {
   const t = String(text || "");
   const hasHan = /[\u4e00-\u9fff]/.test(t);
   const hasKana = /[\u3040-\u30ff]/.test(t);
-  if (target === "en") return !hasHan && !hasKana;
+  const hasHangul = /[\uac00-\ud7af]/.test(t);
+  if (!SUPPORTED_TARGETS.has(target)) return false;
+  if (target === "en") return !hasHan && !hasKana && !hasHangul;
   if (target === "ja") return hasKana && !hasHan;
-  if (target === "ko") return /[\uac00-\ud7af]/.test(t) && !hasHan;
-  if (target === "zh-TW") return hasHan && hasTrad(t) && !hasKana;
-  if (target === "zh-CN") return hasHan && !hasTrad(t) && !hasKana && !/[A-Za-z]{3,}/.test(t);
-  return !hasHan && !hasKana;
+  if (target === "ko") return hasHangul && !hasHan && !hasKana;
+  if (target === "zh-TW") return hasHan && hasTrad(t) && !hasKana && !hasHangul;
+  if (target === "zh-CN") return hasHan && !hasTrad(t) && !hasKana && !hasHangul && !/[A-Za-z]{3,}/.test(t);
+  if (target === "id") return !hasHan && !hasKana && !hasHangul; // 印尼语检测困难，拉丁视为已满足
+  return false;
 }
 
-// 粗略检测源语言（日文假名优先，避免日文混合文本被误判为中文）
+// 粗略检测源语言（日文假名/韩文优先，避免混排文本被误判为中文）
 function detectSrc(text) {
   const t = String(text || "");
   const hasHan = /[\u4e00-\u9fff]/.test(t);
   const hasKana = /[\u3040-\u30ff]/.test(t);
+  const hasHangul = /[\uac00-\ud7af]/.test(t);
   const hasEn = /[A-Za-z]{3,}/.test(t);
   if (hasKana) return "ja";
+  if (hasHangul && !hasHan) return "ko";
   if (hasHan) return hasTrad(t) ? "zh-TW" : "zh-CN";
   if (hasEn) return "en";
   return "zh-CN";
@@ -211,6 +223,25 @@ const resolveAI = (cfg) => {
   };
 };
 
+// 判断是否为本地/免密钥 AI 端点（Ollama 或 localhost 自定义地址）。
+const isLocalAIBase = (base) =>
+  /^https?:\/\/(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(String(base || ""));
+
+// 缓存键：把影响结果的语言/长度/翻译/AI 模型等配置纳入，避免设置变化后命中过期结果。
+function buildCacheKey(source, artist, title, cfg, locale) {
+  const c = cfg || {};
+  const parts = [source, artist, title, normTarget(locale), String(c.contentDetail || "balanced")];
+  parts.push(c.keepOriginal !== false ? "ko" : "kt");
+  parts.push(c.useMyMemory === true ? "mm" : "nomm");
+  if (source === "ai" || source === "ai-memory") {
+    const ai = resolveAI(c);
+    parts.push(String(ai.base || ""));
+    parts.push(String(ai.model || ""));
+    if (c.aiMemoryOnly) parts.push("mem");
+  }
+  return parts.join("\u0001");
+}
+
 // 百度百科词条摘要（meta description）
 async function baikeIntro(folium, title) {
   if (!title) return null;
@@ -233,7 +264,8 @@ async function wikiIntro(folium, title, api) {
   if (!title) return null;
   try {
     const r = await limitedFetch(folium,
-      api + "?action=query&format=json&prop=extracts&explaintext=1&exintro=1&redirects=1&titles=" + enc(title)
+      api + "?action=query&format=json&prop=extracts&explaintext=1&exintro=1&redirects=1&titles=" + enc(title),
+      { timeoutMs: 12000 }
     );
     if (!r.ok) return null;
     const j = r.json();
@@ -253,7 +285,10 @@ async function mbRecording(folium, title, artist) {
   const clean = (s) => String(s || "").replace(/["\\]/g, " ").replace(/\s+/g, " ").trim();
   try {
     const q = 'recording:"' + clean(title) + '"' + (artist ? ' AND artist:"' + clean(artist) + '"' : "");
-    const r = await limitedFetch(folium, MB_API + enc(q), { timeoutMs: 20000 });
+    const r = await limitedFetch(folium, MB_API + enc(q), {
+      timeoutMs: 20000,
+      headers: { "User-Agent": MB_USER_AGENT },
+    });
     if (!r.ok) return null;
     const j = r.json();
     const norm = (v) => String(v || "").normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -336,7 +371,11 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   const ai = resolveAI(cfg);
   const base = String(ai.base || "").replace(/\/+$/, "");
   const model = String(ai.model || "");
-  if (!base || !model || !cfg.apiKey) {
+  const isLocalProvider = (cfg && cfg.aiPreset === "ollama") || isLocalAIBase(base);
+  if (!base || !model) {
+    return { error: "请先配置 AI 服务商和模型" };
+  }
+  if (!cfg.apiKey && !isLocalProvider) {
     return { error: "请先配置 AI 服务商和模型，并在「AI API 密钥」设置中保存密钥" };
   }
 
@@ -439,12 +478,11 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
     (hasCtx ? "【检索资料】\n" + ctx + "\n\n请根据以上资料整理" : "请整理") +
     ' 歌曲《' + title + '》 - 歌手：' + artist + ' 的资料并输出 JSON。';
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (cfg.apiKey) headers.Authorization = "Bearer " + cfg.apiKey;
     const r = await limitedFetch(folium, endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + cfg.apiKey,
-      },
+      headers,
       body: JSON.stringify({
         model: model,
         // 检索整理用低温度 0.25 减少事实字段编造；AI 记忆补充单独保持较高温度（用户设置或 0.7）
@@ -511,26 +549,23 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
     if (obj && typeof obj === "object") {
       const song = obj.song || {};
       const art = obj.artist || {};
+      // 兜底翻译并行处理，避免多个非目标语言字段时串行累积延迟。
+      const [album, writers, composers, arranger, genre, origin, content, listeningNotes, sourceField] = await Promise.all([
+        fix(song.album), fix(song.writers), fix(song.composers), fix(song.arranger),
+        fix(song.genre), fix(song.origin), fix(song.content), fix(song.listeningNotes), fix(song.source),
+      ]);
+      const [artistName, bio, representativeWorks, honors, career] = await Promise.all([
+        fix(art.name), fix(art.bio), fix(art.representativeWorks), fix(art.honors), fix(art.career),
+      ]);
       obj.song = {
-        album: await fix(song.album),
+        album,
         year: String(song.year || "").trim(),
         releaseDate: String(song.releaseDate || "").trim(),
-        writers: await fix(song.writers),
-        composers: await fix(song.composers),
-        arranger: await fix(song.arranger),
-        genre: await fix(song.genre),
-        origin: await fix(song.origin),
-        content: await fix(song.content),
-        listeningNotes: await fix(song.listeningNotes),
-        source: await fix(song.source),
+        writers, composers, arranger, genre, origin, content,
+        listeningNotes,
+        source: sourceField,
       };
-      obj.artist = {
-        name: await fix(art.name),
-        bio: await fix(art.bio),
-        representativeWorks: await fix(art.representativeWorks),
-        honors: await fix(art.honors),
-        career: await fix(art.career),
-      };
+      obj.artist = { name: artistName, bio, representativeWorks, honors, career };
     }
     if (detailMode === "detailed" || (cfg && cfg.aiMemoryOnly)) {
       const memory = obj && obj.memorySupplement && typeof obj.memorySupplement === "object" ? obj.memorySupplement : {};
@@ -606,7 +641,7 @@ async function publicLookup(folium, artist, title, cfg, target, keepOriginal) {
   const mb = (mbHit && mbHit.mb) || null;
   const empty = !artistIntro && !songIntro && !mbHit;
   const ai = resolveAI(cfg || {});
-  const hasAI = !!ai.base && !!ai.model && !!(cfg && cfg.apiKey);
+  const hasAI = !!ai.base && !!ai.model && !!(cfg && (cfg.apiKey || cfg.aiPreset === "ollama" || isLocalAIBase(ai.base)));
   if (empty && hasAI) {
     const g = await aiLookup(folium, cfg, artist, title, target, keepOriginal);
     if (g && g.ai && !g.error) return { artistIntro: null, songIntro: null, mb: null, ai: g.ai, error: null, generatedByAi: !!g.generatedByAi, aiAggregated: !!g.aiAggregated, sources: g.sources || [] };
@@ -641,8 +676,10 @@ async function saveCache(folium, cache) {
       delete cache[keys.shift()];
     }
     await folium.storage.set(CACHE_KEY, cache);
+    return true;
   } catch (e) {
     folium.log.warn("cache save failed", String((e && e.message) || e));
+    return false;
   }
 }
 
@@ -878,16 +915,16 @@ export default function activate(folium) {
             const useful = d && !d.error && (d.ai || d.artistIntro || d.songIntro || (d.mb && (d.mb.album || d.mb.year || d.mb.releaseDate)));
             if (useful && !current[key]) current[key] = entry;
           }
-          await saveCache(folium, current);
-          // 旧缓存可能含未截断的长正文；迁移后删除旧键，避免占用 1 MB storage 配额。
-          await folium.storage.delete("si-cache");
+          const ok = await saveCache(folium, current);
+          // 旧缓存可能含未截断的长正文；只有新缓存写入成功才删除旧键，避免配额/权限失败时丢数据。
+          if (ok) await folium.storage.delete("si-cache");
         }
       } catch (e) { folium.log.warn("legacy cache migration failed", String((e && e.message) || e)); }
     })();
     return cacheMigrationPromise;
   };
   const lookupAndCache = async (cfg, artist, title, source, force) => {
-    const cacheKey = source + "\u0001" + artist + "\u0001" + title;
+    const cacheKey = buildCacheKey(source, artist, title, cfg || {}, curLocale);
     if (!force && inflight.has(cacheKey)) return inflight.get(cacheKey);
     const p = (async () => {
       await migrateLegacyCache();
@@ -1052,7 +1089,20 @@ export default function activate(folium) {
 
       // 内容替换：先隐藏 → 测高 → 高度平滑过渡（速度恒定）→ 淡入显示。
       // 过渡期间 body 裁剪溢出，保证新内容不会在高度过渡中提前溢出可见。
+      // 竞态防护：每轮动画用自增序号 + 单一 timer，旧轮回调过期即忽略，避免快速切歌时旧定时器清理新内容。
+      let animSeq = 0;
+      let animTimer = null;
       const applyContent = (html) => {
+        animSeq += 1;
+        if (animTimer) { clearTimeout(animTimer); animTimer = null; }
+        const mySeq = animSeq;
+        let ran = false;
+        const settle = (fn) => {
+          if (ran || animSeq !== mySeq) return; // 已执行过或已是过期轮次，直接忽略
+          ran = true;
+          if (animTimer) { clearTimeout(animTimer); animTimer = null; }
+          fn();
+        };
         // 锁定当前高度（动画起点：挂载时的占位高度或当前内容高度），并隐藏内容
         const h0 = root.offsetHeight || 0;
         root.style.transition = "none";
@@ -1066,22 +1116,22 @@ export default function activate(folium) {
           // 内容淡入
           body.style.transition = "opacity .18s ease";
           body.style.opacity = "1";
-          const done = () => {
+          const done = () => settle(() => {
             body.style.transition = "";
             body.style.opacity = "";
             body.style.overflow = "";
             root.style.height = "";
             root.style.transition = "";
             lastPanelH = root.offsetHeight; // 记录本次面板高度，供下次挂载作过渡起点
-          };
+          });
           body.addEventListener("transitionend", done, { once: true });
-          setTimeout(done, 320);
+          animTimer = setTimeout(done, 320);
         };
-        const finish = () => {
+        const finish = () => settle(() => {
           root.style.height = "";
           root.style.transition = "";
           show();
-        };
+        });
         if (Math.abs(h1 - h0) > 2) {
           const diff = Math.abs(h1 - h0);
           const dur = Math.min(0.5, Math.max(0.12, diff / 800)); // 速度恒定
@@ -1089,7 +1139,7 @@ export default function activate(folium) {
           root.style.transition = `height ${dur}s ease`;
           root.style.height = h1 + "px";
           root.addEventListener("transitionend", finish, { once: true });
-          setTimeout(finish, dur * 1000 + 100);
+          animTimer = setTimeout(finish, dur * 1000 + 100);
         } else {
           finish();
         }
@@ -1111,7 +1161,7 @@ export default function activate(folium) {
         const cfg = cfgParams ? cfgParams.get() : { source: "baike" };
         const artist = song.artist || "";
         const title = song.title || "";
-        const cacheKey = (cfg.source || "baike") + "\u0001" + artist + "\u0001" + title;
+        const cacheKey = buildCacheKey(cfg.source || "baike", artist, title, cfg, curLocale);
         curCacheKey = cacheKey;
         const autoEnabled = String(cfg.source || "baike") === "ai" && await isAutoMemoryEnabled(cfg);
 
@@ -1186,7 +1236,9 @@ export default function activate(folium) {
             const result = await lookupAndCache(cfg, song.artist || "", song.title, "ai-memory", true);
             if (result && !result.error && result.ai) {
               const cache = await loadCache(folium);
-              const normalKey = "ai\u0001" + (song.artist || "") + "\u0001" + song.title;
+              // 缓存键与当前渲染一致（含语言/长度/翻译/AI 模型等配置），
+              // 公开检索回退 AI 时也写回当前显示的数据键，刷新后能看到补充内容。
+              const normalKey = curCacheKey || buildCacheKey("ai", song.artist || "", song.title, { ...(cfgParams && cfgParams.get ? cfgParams.get() : {}), source: "ai" }, curLocale);
               const old = cache[normalKey] && cache[normalKey].data;
               if (old && old.ai) {
                 const mergeMemory = (dst, src) => {
@@ -1287,7 +1339,7 @@ export default function activate(folium) {
             html += section("主要荣誉", honors, 420);
           }
           if (!bio && !honors && !career && !representativeWorks && !songSource && !origin && !content && !credits && !s.listeningNotes) html += '<div class="si-none">AI 未返回有效内容，可点「重新生成」重试</div>';
-          html += regenBtn(false);
+          html += regenBtn(aiDisabled);
           html += '<div class="si-foot">' + (data.generatedByAi ? (data.aiAggregated ? "AI 参考公开检索后生成；内容未逐项核实" : "AI 生成，未经检索；内容未核实") : "AI 整理内容仅供参考；来源：" + sourceLinksHtml(data.sources || [], sourceQuery)) + (detailMode === "detailed" ? "。详细挡位中带【AI记忆补充·未经检索核实】标记的文字来自模型自身知识，不属于公开来源。" : "") + '</div>';
           return html;
         }
