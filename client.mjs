@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.4.0（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.4.1（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.4.0 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.4.1 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -1058,7 +1058,48 @@ export default function activate(folium) {
           saveStatus.textContent = en ? "Saved — changes are now active." : "已保存，改动已生效。";
         });
         saveRow.append(saveBtn, saveStatus);
-        wrap.append(groupPublic, groupAI, groupCommon, saveRow);
+        // 详细说明：以统一文段介绍模组基本行为（不采用版本更新记录格式）
+        const detailRow = document.createElement("div");
+        detailRow.style.cssText = "display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:18px;";
+        const detailBtn = document.createElement("button");
+        detailBtn.type = "button";
+        detailBtn.textContent = en ? "Detailed description" : "详细说明";
+        detailBtn.style.cssText = "align-self:flex-start;padding:9px 16px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:transparent;color:inherit;cursor:pointer;font-size:13px;";
+        const detailBody = document.createElement("div");
+        detailBody.style.cssText = "display:none;font-size:13px;line-height:1.8;opacity:.94;color:inherit;";
+        detailBody.innerHTML =
+          (en ? "<b>Basic behavior</b>" : "<b>基本行为</b>") + "<p>" +
+          (en
+            ? "This mod shows song and artist info on the playback page: click the info button on the right of the progress bar to open the Song info panel for the current track."
+            : "本模组在播放页展示歌曲与歌手资料：点击播放进度条右侧的信息按钮，即可打开「歌曲资料」面板查看当前曲目的相关信息。") +
+          "</p><b>" + (en ? "Search behavior" : "检索行为") + "</b><p>" +
+          (en
+            ? "Public search queries Douban Music, Moegirlpedia, Baidu Baike and MusicBrainz at the same time and prefers whichever returns valid content first; the content-length level decides how many entries are used (Concise=1, Standard=2, Detailed=4). Public search only shows real retrieved data and never calls AI. AI search fills gaps on top of public results and may generate content from the model's own knowledge, always shown at the Detailed level. AI generation and AI memory supplement share the same AI endpoint and merge logic."
+            : "公开检索会同时向豆瓣音乐、萌娘百科、百度百科和 MusicBrainz 四个来源发起查询，哪个来源先返回有效内容就优先采用；内容长度挡位决定采用条数（简洁 1 条、标准 2 条、详细 4 条）。公开检索只显示真实检索到的数据，不调用任何 AI。AI 检索在公开检索结果基础上补足缺口，必要时使用模型自身知识生成内容，固定按「详细」挡位展示。AI 生成与 AI 记忆补充共用同一个 AI 接口与查询合并逻辑。") +
+          "</p><b>" + (en ? "AI memory supplement" : "AI 记忆补充") + "</b><p>" +
+          (en
+            ? "If the AI result has missing sections or too little content, the mod automatically (or when you click the button) calls AI memory supplement to fill the seven sections (credits, artist bio, representative works, artist career, background, source, listening notes) from the model's own knowledge. When sections are complete and content is sufficient it does not trigger automatically, avoiding unnecessary cost. With auto-supplement enabled, switching away and back to the tab re-checks once."
+            : "AI 检索结果若有栏目缺失或内容过少，会自动（或由你点击按钮）调用 AI 记忆补充，凭模型自身知识补全作曲作词、歌手简介、歌手代表作、歌手经历、创作与发行背景、歌曲出处、聆听解读七个栏目；栏目齐全且内容充足时不自动触发，避免产生不必要的费用。开启自动补充后，切换到其他标签页再切回时也会自动复查一次。") +
+          "</p><b>" + (en ? "Cache and queries" : "缓存与查询") + "</b><p>" +
+          (en
+            ? "Successful results are cached for 30 days; failed results are never cached. AI search waits at most 6 seconds for public fragments. Click Regenerate anytime to clear the cache and query again. Queries run only while the panel is open; same-host requests are rate-limited and stop once enough results are found. The optional Preload-next feature queries and caches the next track ahead of time (AI search only, may incur extra cost, off by default)."
+            : "成功的查询结果会缓存 30 天，失败结果不会缓存；AI 检索的公开片段最多等待 6 秒。可随时点击「重新生成」清除缓存重新查询。面板打开时才发起查询；同源请求有间隔限流，命中足够结果即停止，避免高频抓取。可选的「预加载下一首」会在切歌时提前查询并缓存下一首资料（仅 AI 检索模式、可能产生额外调用费用，默认关闭）。") +
+          "</p><b>" + (en ? "Translation" : "翻译") + "</b><p>" +
+          (en
+            ? "The translation target follows the app language: AI search only shows the app language. Keep original text applies to real public-search data only. MyMemory online translation is off by default; when enabled, up to 1800 characters of the text may be sent to the translation service."
+            : "翻译目标跟随软件语言：AI 检索只显示软件使用语言；「保留原文」仅作用于公开检索到的真实资料。MyMemory 在线翻译默认关闭，开启后最多可能发送 1800 字资料文本至该翻译服务。") +
+          "</p><b>" + (en ? "Keys and privacy" : "密钥与隐私") + "</b><p>" +
+          (en
+            ? "The AI provider API key is stored in local mod storage and is not exported with visual-config exports; local storage is not OS-level encryption. With AI enabled, song/artist names and retrieved fragments are sent to the AI provider you chose and may incur cost; please read its privacy policy. AI-generated and AI-supplemented content comes from the model's own knowledge and is not verified. Public data may be outdated or mismatched; please follow the source pages' copyright, attribution and license terms."
+            : "AI 服务商的 API 密钥保存在本机模组存储中，不作为普通设置随视觉配置导出；本地存储并非操作系统级加密。启用 AI 后，歌曲名、歌手名与检索片段会发送至你选择的 AI 服务商，并可能产生费用，请阅读其隐私政策。AI 生成与 AI 记忆补充的内容均来自模型自身知识、未经检索核实，仅供阅读参考。公开资料可能过时、缺失或匹配错误；请遵守来源页面适用的版权、署名与许可要求。") +
+          "</p>";
+        detailBtn.addEventListener("click", () => {
+          const show = detailBody.style.display === "none";
+          detailBody.style.display = show ? "" : "none";
+          detailBtn.textContent = show ? (en ? "Hide details" : "收起说明") : (en ? "Detailed description" : "详细说明");
+        });
+        detailRow.append(detailBtn, detailBody);
+        wrap.append(groupPublic, groupAI, groupCommon, saveRow, detailRow);
         container.appendChild(wrap);
 
         const refresh = () => {
