@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.4.1（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.5.0（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.4.1 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.5.0 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -221,6 +221,33 @@ const resolveAI = (cfg) => {
 const isLocalAIBase = (base) =>
   /^https?:\/\/(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(String(base || ""));
 
+// AI 端点校验：默认只允许 HTTPS；仅明确配置的本机地址（localhost/127.x/0.0.0.0/[::1]）放行 HTTP。
+// 校验失败时调用方必须停止请求（不发送密钥），并向用户返回可操作的错误提示。
+const validateAIEndpoint = (base) => {
+  const raw = String(base || "").trim();
+  if (!raw) return "未配置 AI 接口地址";
+  let url;
+  try { url = new URL(raw); } catch (_) { return "AI 接口地址无效，请检查设置中的接口地址（需为完整 URL）"; }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalAIBase(raw))) {
+    return "AI 接口地址必须使用 HTTPS；仅本机地址（localhost/127.x/0.0.0.0）允许 HTTP，未发送请求";
+  }
+  return null;
+};
+
+// AI 返回字段类型校验：字符串/数字转为展示文本；数组仅接受字符串或数字成员并安全连接；
+// 对象、布尔值与其他意外类型返回空字符串，避免展示 [object Object]。
+const toDisplayText = (value) => {
+  if (typeof value === "string" || typeof value === "number") return String(value).trim();
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => typeof item === "string" || typeof item === "number")
+      .map((item) => String(item).trim())
+      .filter(Boolean)
+      .join("、");
+  }
+  return "";
+};
+
 function buildCacheKey(source, artist, title, cfg, locale) {
   const c = cfg || {};
   const parts = [source, artist, title, normTarget(locale), String(c.contentDetail || "balanced")];
@@ -379,6 +406,12 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   if (!base || !model) {
     return { error: "请先配置 AI 服务商和模型" };
   }
+  // 发送密钥前先校验端点协议/主机；校验失败立即停止，密钥不发送
+  const endpointError = validateAIEndpoint(base);
+  if (endpointError) {
+    folium.log.warn("aiLookup blocked: " + endpointError + " base=" + base);
+    return { error: endpointError + "；请修正「接口地址（自定义）」后重试" };
+  }
   if (!cfg.apiKey && !isLocalProvider) {
     return { error: "请先配置 AI 服务商和模型，并在「AI API 密钥」设置中保存密钥" };
   }
@@ -530,14 +563,14 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       return !/[\u3040-\u30ff\u4e00-\u9fff]/.test(x);
     };
     const fix = async (v) => {
-      const s = String(v || "").trim();
-      if (!s) return v;
-      if (s === "未知" || s.toLowerCase() === "unknown") return v;
+      const s = toDisplayText(v); // 对象/布尔等意外类型在此归空，避免 [object Object]
+      if (!s) return "";
+      if (s === "未知" || s.toLowerCase() === "unknown") return "";
       if (looksTarget(s, tgt)) {
         if (tgt === "zh-CN" && hasTrad(s)) {
           return await translateForPublic(folium, s, tgt, effKeep, cfg.useMyMemory === true);
         }
-        return v;
+        return s;
       }
       return await translateForPublic(folium, s, tgt, effKeep, cfg.useMyMemory === true);
     };
@@ -551,7 +584,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       const stageMemory = (targetObj, memoryObj) => {
         if (!targetObj || !memoryObj) return;
         for (const key of Object.keys(memoryObj)) {
-          const value = String(memoryObj[key] || "").replace(/^【(ai\s*生成|AI记忆补充·未经检索核实)】/i, "").trim();
+          const value = toDisplayText(memoryObj[key]).replace(/^【(ai\s*生成|AI记忆补充·未经检索核实)】/i, "").trim();
           if (value && (isMemOnly || targetObj[key] == null || !String(targetObj[key] || "").trim())) {
             targetObj[key] = value;
           }
@@ -574,8 +607,8 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       ]);
       obj.song = {
         album,
-        year: String(song.year || "").trim(),
-        releaseDate: String(song.releaseDate || "").trim(),
+        year: toDisplayText(song.year),
+        releaseDate: toDisplayText(song.releaseDate),
         writers, composers, arranger, genre, origin,
         content: contentField,
         listeningNotes,
@@ -656,11 +689,16 @@ async function loadCache(folium) {
 
 async function saveCache(folium, cache) {
   try {
+    // 序列化一次得到初始估算，裁剪时按被删条目增量递减，避免每轮循环重复序列化整个缓存
     const keys = Object.keys(cache).sort((a, b) => (cache[a].ts || 0) - (cache[b].ts || 0));
-    const sizeEstimate = () => JSON.stringify(cache).length * 3;
-    while (keys.length > 120 || sizeEstimate() > CACHE_MAX_BYTES) {
-      if (!keys.length) break;
-      delete cache[keys.shift()];
+    const sizeOf = (k) => JSON.stringify(cache[k] || "").length * 3 + k.length * 3;
+    let sizeEst = JSON.stringify(cache).length * 3;
+    let idx = 0;
+    while (keys.length - idx > 120 || sizeEst > CACHE_MAX_BYTES) {
+      if (idx >= keys.length) break;
+      const victim = keys[idx++];
+      sizeEst -= sizeOf(victim);
+      delete cache[victim];
     }
     await folium.storage.set(CACHE_KEY, cache);
     return true;
@@ -807,40 +845,49 @@ export default function activate(folium) {
   // 不再依赖宿主 settings 对象，从根上避免「设置不保存 / 面板改了查询读不到」。
   const SETTINGS_KEY = "si-settings-v2";
   let settingsMem = null;
+  let settingsDirty = false; // 是否有尚未落盘的、由用户（或面板暂存提交）发起的修改
   let settingsLoadPromise = null;
   const DEFAULT_SETTINGS = (() => {
     const d = {};
     for (const def of settingsSchema) d[def.key] = def.defaultValue;
     return d;
   })();
+  // 加载以持久化配置为准：仅当加载期间确实发生用户修改（settingsDirty）时，才把这些修改合并进去。
+  // 不再用「settingsMem 是否有键」判断用户是否改过设置（getCfg 的默认值副本不应被当成用户修改）。
   const ensureSettingsLoaded = () => {
     if (!settingsLoadPromise) {
       settingsLoadPromise = (async () => {
         try {
           const v = await folium.storage.get(SETTINGS_KEY);
-          if (settingsMem && Object.keys(settingsMem).length) {
-            // 会话内用户已改过设置：以内存为准合并并回写，避免加载完成覆盖用户改动
-            const merged = { ...DEFAULT_SETTINGS, ...(v && typeof v === "object" ? v : {}), ...settingsMem };
-            settingsMem = merged;
-            folium.storage.set(SETTINGS_KEY, merged).catch(() => {});
-          } else {
-            settingsMem = { ...DEFAULT_SETTINGS, ...(v && typeof v === "object" ? v : {}) };
-          }
+          const stored = v && typeof v === "object" ? v : {};
+          settingsMem = {
+            ...DEFAULT_SETTINGS,
+            ...stored,
+            ...(settingsDirty && settingsMem ? settingsMem : {}),
+          };
         } catch (_) {
-          settingsMem = settingsMem || { ...DEFAULT_SETTINGS };
+          settingsMem = {
+            ...DEFAULT_SETTINGS,
+            ...(settingsDirty && settingsMem ? settingsMem : {}),
+          };
         }
       })();
     }
     return settingsLoadPromise;
   };
-  const getCfg = () => {
-    if (!settingsMem) settingsMem = { ...DEFAULT_SETTINGS };
-    return settingsMem;
-  };
+  const getCfg = () => (settingsMem ? settingsMem : { ...DEFAULT_SETTINGS });
+  // 保存串行化：连续写入按顺序落盘，后写的永远最后完成，避免旧写入覆盖新值
+  let settingsWriteChain = Promise.resolve();
   const writeCfg = (key, value) => {
+    settingsDirty = true;
     const next = { ...getCfg(), [key]: value };
     settingsMem = next;
-    ensureSettingsLoaded().then(() => folium.storage.set(SETTINGS_KEY, next)).catch((e) => folium.log.warn("setting save failed: " + key, String((e && e.message) || e)));
+    settingsWriteChain = settingsWriteChain
+      .then(() => ensureSettingsLoaded())
+      .then(() => folium.storage.set(SETTINGS_KEY, settingsMem))
+      .then(() => { settingsDirty = false; })
+      .catch((e) => folium.log.warn("setting save failed: " + key, String((e && e.message) || e)));
+    return settingsWriteChain;
   };
 
   try {
@@ -848,8 +895,8 @@ export default function activate(folium) {
       id: "ai-config",
       label: { "zh-CN": "资料查询", en: "Info lookup" },
       description: {
-        "zh-CN": "公开检索：豆瓣音乐、萌娘百科、百度百科、MusicBrainz 四个来源同时查询，按返回速度取用（简洁取第 1 个、标准取前 2 个、详细取全部 4 个有效来源），维基不参与公开检索。AI 检索固定使用「详细」挡位：豆瓣、萌娘、维基（中/英）、百度、MusicBrainz，公开片段最多等 6 秒。只有打开歌曲资料面板时才发起查询。AI 功能关闭时不会调用 AI。开启 MyMemory 翻译后，最多 1800 字资料原文（可能含歌名/歌手等内容）会发送给 api.mymemory.translated.net；默认关闭。AI 查询会把歌曲/歌手信息及检索到的资料发送到你选择的 AI 服务商，请只使用你信任的服务商。API 密钥单独保存在本机模组存储，不进入视觉配置导出。",
-        en: "Sources are queried on demand only while the Song Info panel is open. MyMemory translation is off by default; when enabled, up to 1,800 characters of source text may be sent to api.mymemory.translated.net. AI queries send song/artist details and retrieved excerpts to your selected provider. The API key is stored separately in local mod storage and excluded from visual-config exports."
+        "zh-CN": "公开检索：豆瓣音乐、萌娘百科、百度百科、MusicBrainz 四个来源同时查询，按返回速度取用（简洁取第 1 个、标准取前 2 个、详细取全部 4 个有效来源），维基不参与公开检索。AI 检索固定使用「详细」挡位：豆瓣、萌娘、维基（中/英）、百度、MusicBrainz，公开片段最多等 6 秒。只有打开歌曲资料面板时才发起查询。AI 功能关闭时不会调用 AI。开启 MyMemory 翻译后，最多 1800 字资料原文（可能含歌名/歌手等内容）会发送给 api.mymemory.translated.net；默认关闭。AI 查询会把歌曲/歌手信息及检索到的资料发送到你选择的 AI 服务商，请只使用你信任的服务商；自定义接口地址会收到 API 密钥与歌曲资料，仅允许 HTTPS 或本机地址（localhost/127.x），校验不通过不会发送请求。API 密钥单独保存在本机模组存储，不进入视觉配置导出。",
+        en: "Sources are queried on demand only while the Song Info panel is open. MyMemory translation is off by default; when enabled, up to 1,800 characters of source text may be sent to api.mymemory.translated.net. AI queries send song/artist details and retrieved excerpts to your selected provider; a custom endpoint also receives your API key and is restricted to HTTPS or a local address. The API key is stored separately in local mod storage and excluded from visual-config exports."
       },
       settings: settingsSchema,
       settingsPanel: (container, ctx) => {
@@ -1033,7 +1080,9 @@ export default function activate(folium) {
         groupAI.append(buttons, status);
         // AI 检索固定「详细」的说明（内容长度选项已不在 AI tab 提供）
         const aiFixedNote = document.createElement("small");
-        aiFixedNote.textContent = en ? "AI lookup always uses the Detailed level; the content-length option applies to public search only." : "AI 检索固定使用「详细」挡位；内容长度选项仅用于公开检索。";
+        aiFixedNote.textContent = en
+          ? "AI lookup always uses the Detailed level; the content-length option applies to public search only. A custom endpoint receives your API key and song/artist data; only HTTPS or a local address is allowed."
+          : "AI 检索固定使用「详细」挡位；内容长度选项仅用于公开检索。自定义接口地址会收到你的 API 密钥与歌曲资料；仅允许 HTTPS 或本机地址（localhost/127.x），其他协议不会发送请求。";
         aiFixedNote.style.cssText = "opacity:.65;line-height:1.4;";
         groupAI.appendChild(aiFixedNote);
         // 保存设置：统一写入暂存的全部改动后生效（API 密钥仍即时保存）
@@ -1169,7 +1218,10 @@ export default function activate(folium) {
     })().catch((e) => {
       folium.log.warn("lookup failed", String((e && e.message) || e));
       return { error: "查询失败：" + String((e && e.message) || e || "未知错误") + "。这不一定代表设备断网；请检查接口地址、服务商状态、访问权限及控制台日志。失败结果不会缓存。" };
-    }).finally(() => inflight.delete(cacheKey));
+    }).finally(() => {
+      // 仅当 Map 中保存的仍是对应当前请求的 Promise 时才清理，避免旧请求结束误删新请求的进行中标记
+      if (inflight.get(cacheKey) === p) inflight.delete(cacheKey);
+    });
     inflight.set(cacheKey, p);
     return p;
   };
