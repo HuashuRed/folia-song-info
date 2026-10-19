@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.3.1（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.3.2（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.3.1 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.3.2 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -858,7 +858,7 @@ export default function activate(folium) {
         const en = locale.toLowerCase().startsWith("en");
         const labelText = (v) => typeof v === "string" ? v : (v && (v[locale] || v[locale.split("-")[0]] || v["zh-CN"] || v.en)) || "";
         const wrap = document.createElement("div");
-        wrap.style.cssText = "display:flex;flex-direction:column;gap:18px;padding:10px 0;";
+        wrap.style.cssText = "display:flex;flex-direction:column;gap:28px;padding:12px 0;";
         const controls = new Map();
         const getValues = () => getCfg();
         // 改动先进入暂存区，点击「保存设置」后才统一写入并生效
@@ -867,7 +867,7 @@ export default function activate(folium) {
 
         // 顶部分组标签：公开检索 / AI 检索（类似浏览器标签，点击即切换数据源）
         const tabs = document.createElement("div");
-        tabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px;";
+        tabs.style.cssText = "display:flex;gap:10px;margin-bottom:12px;";
         const switchTab = (src) => {
           const isPublic = String(src || "baike") === "baike";
           groupPublic.style.display = isPublic ? "" : "none";
@@ -892,15 +892,15 @@ export default function activate(folium) {
 
         // 分组容器：公开检索 / AI 检索 独有项 + 两 tab 共通的底部公共区
         const groupPublic = document.createElement("div");
-        groupPublic.style.cssText = "display:flex;flex-direction:column;gap:16px;";
+        groupPublic.style.cssText = "display:flex;flex-direction:column;gap:26px;";
         const groupAI = document.createElement("div");
-        groupAI.style.cssText = "display:flex;flex-direction:column;gap:16px;";
+        groupAI.style.cssText = "display:flex;flex-direction:column;gap:26px;";
         const groupCommon = document.createElement("div");
-        groupCommon.style.cssText = "display:flex;flex-direction:column;gap:16px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:16px;";
+        groupCommon.style.cssText = "display:flex;flex-direction:column;gap:26px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:22px;";
         const groupTitle = (t) => {
           const d = document.createElement("div");
           d.textContent = t;
-          d.style.cssText = "font-size:13px;font-weight:700;margin:0;";
+          d.style.cssText = "font-size:14px;font-weight:700;margin:0;";
           return d;
         };
         groupPublic.appendChild(groupTitle(en ? "Public search settings" : "公开检索设置"));
@@ -915,7 +915,7 @@ export default function activate(folium) {
         for (const def of settingsSchema) {
           if (def.key === "source") continue; // 数据源由顶部标签代替
           const row = document.createElement("label");
-          row.style.cssText = "display:flex;flex-direction:column;gap:8px;font-size:13px;color:inherit;";
+          row.style.cssText = "display:flex;flex-direction:column;gap:12px;font-size:13px;color:inherit;";
           const title = document.createElement("span");
           title.textContent = labelText(def.label);
           const hoverHelp = ["preloadNext", "keepOriginal", "useMyMemory", "autoAiMemorySupplement"].includes(def.key);
@@ -936,7 +936,7 @@ export default function activate(folium) {
           let input;
           if (def.type === "select") {
             input = document.createElement("select");
-            input.style.cssText = "box-sizing:border-box;width:100%;padding:7px 9px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:7px;background:var(--folium-background,var(--folium-surface,Canvas));color:var(--folium-button-text,var(--folium-primary-foreground,ButtonText));color-scheme:inherit;";
+            input.style.cssText = "box-sizing:border-box;width:100%;padding:12px 14px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:var(--folium-background,var(--folium-surface,Canvas));color:var(--folium-button-text,var(--folium-primary-foreground,ButtonText));color-scheme:inherit;";
             for (const opt of (def.options || [])) {
               const option = document.createElement("option");
               option.value = opt.value;
@@ -952,9 +952,9 @@ export default function activate(folium) {
             input.addEventListener("change", () => setPending(def.key, input.checked));
             row.style.flexDirection = "row";
             row.style.alignItems = "center";
-            row.style.gap = "10px";
-            input.style.width = "16px";
-            input.style.height = "16px";
+            row.style.gap = "14px";
+            input.style.width = "17px";
+            input.style.height = "17px";
             row.insertBefore(input, title);
             title.style.order = "1";
           } else {
@@ -964,7 +964,7 @@ export default function activate(folium) {
             if (def.min != null) input.min = String(def.min);
             if (def.max != null) input.max = String(def.max);
             if (def.step != null) input.step = String(def.step);
-            input.style.cssText = "box-sizing:border-box;width:100%;padding:10px 12px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:var(--folium-background,var(--folium-surface,transparent));color:inherit;color-scheme:inherit;";
+            input.style.cssText = "box-sizing:border-box;width:100%;padding:12px 14px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:var(--folium-background,var(--folium-surface,transparent));color:inherit;color-scheme:inherit;";
             const commit = () => {
               const value = def.type === "number" ? Number(input.value) : input.value;
               if (def.type !== "number" || input.value.trim() !== "") setPending(def.key, value);
@@ -978,7 +978,7 @@ export default function activate(folium) {
         }
         const keyTitle = document.createElement("div");
         keyTitle.textContent = en ? "AI API key (stored locally)" : "AI API 密钥（本机保存）";
-        keyTitle.style.cssText = "font-size:13px;font-weight:600;margin-top:8px;";
+        keyTitle.style.cssText = "font-size:13px;font-weight:600;margin-top:14px;";
         groupAI.appendChild(keyTitle);
         const keyHelp = document.createElement("small");
         keyHelp.textContent = en ? "Not included in visual-config exports. Local storage is not an OS-encrypted keychain." : "密钥不会写入视觉配置导出；本地存储并非操作系统加密密钥库。";
@@ -989,7 +989,7 @@ export default function activate(folium) {
         input.autocomplete = "new-password";
         input.spellcheck = false;
         input.placeholder = en ? "Paste API key, then Save" : "粘贴 API 密钥后点击保存";
-        input.style.cssText = "box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid var(--folium-border,#777);border-radius:8px;background:var(--folium-surface,transparent);color:inherit;";
+        input.style.cssText = "box-sizing:border-box;width:100%;padding:12px 14px;border:1px solid var(--folium-border,#777);border-radius:8px;background:var(--folium-surface,transparent);color:inherit;";
         groupAI.appendChild(input);
         const buttons = document.createElement("div");
         buttons.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
@@ -997,7 +997,7 @@ export default function activate(folium) {
           const b = document.createElement("button");
           b.type = "button";
           b.textContent = text;
-          b.style.cssText = "padding:6px 12px;border:1px solid var(--folium-border,#777);border-radius:7px;background:transparent;color:inherit;cursor:pointer;";
+          b.style.cssText = "padding:9px 16px;border:1px solid var(--folium-border,#777);border-radius:8px;background:transparent;color:inherit;cursor:pointer;";
           return b;
         };
         const save = makeButton(en ? "Save key" : "保存密钥");
@@ -1038,7 +1038,7 @@ export default function activate(folium) {
         groupAI.appendChild(aiFixedNote);
         // 保存设置：统一写入暂存的全部改动后生效（API 密钥仍即时保存）
         const saveRow = document.createElement("div");
-        saveRow.style.cssText = "display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:16px;";
+        saveRow.style.cssText = "display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:22px;";
         const saveBtn = document.createElement("button");
         saveBtn.type = "button";
         saveBtn.textContent = en ? "Save settings" : "保存设置";
