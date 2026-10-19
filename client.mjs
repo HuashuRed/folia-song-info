@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.5.0（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.5.1（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.5.0 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.5.1 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -218,20 +218,35 @@ const resolveAI = (cfg) => {
   };
 };
 
-const isLocalAIBase = (base) =>
-  /^https?:\/\/(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(String(base || ""));
-
-// AI 端点校验：默认只允许 HTTPS；仅明确配置的本机地址（localhost/127.x/0.0.0.0/[::1]）放行 HTTP。
-// 校验失败时调用方必须停止请求（不发送密钥），并向用户返回可操作的错误提示。
-const validateAIEndpoint = (base) => {
+// AI 端点解析与校验：默认只允许 HTTPS；仅 localhost / 127.0.0.1 / ::1 允许 HTTP。
+// 校验失败返回 { error }，调用方必须停止请求（不发送密钥）；成功返回解析后的完整 URL（自动拼接 /chat/completions）。
+// 本机地址的判定基于解析后的 hostname，不再放行 0.0.0.0 与任意 127.x.x.x。
+const parseAIEndpoint = (base) => {
   const raw = String(base || "").trim();
-  if (!raw) return "未配置 AI 接口地址";
+  if (!raw) return { error: "未配置 AI 接口地址" };
   let url;
-  try { url = new URL(raw); } catch (_) { return "AI 接口地址无效，请检查设置中的接口地址（需为完整 URL）"; }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalAIBase(raw))) {
-    return "AI 接口地址必须使用 HTTPS；仅本机地址（localhost/127.x/0.0.0.0）允许 HTTP，未发送请求";
+  try {
+    url = new URL(raw);
+  } catch (_) {
+    return { error: "AI 接口地址无效，请检查设置中的接口地址（需为完整 URL）" };
   }
-  return null;
+  if (url.username || url.password) {
+    return { error: "接口地址不能包含用户名或密码" };
+  }
+  const hostname = url.hostname.toLowerCase();
+  const isLocal = hostname === "localhost"
+    || hostname === "127.0.0.1"
+    || hostname === "::1";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocal)) {
+    return {
+      error: "AI 接口地址必须使用 HTTPS；仅 localhost、127.0.0.1 和 ::1 允许 HTTP，未发送请求",
+    };
+  }
+  const path = url.pathname.replace(/\/+$/, "");
+  if (!path.endsWith("/chat/completions")) {
+    url.pathname = path + "/chat/completions";
+  }
+  return { url: url.toString(), isLocal };
 };
 
 // AI 返回字段类型校验：字符串/数字转为展示文本；数组仅接受字符串或数字成员并安全连接；
@@ -402,16 +417,17 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   const ai = resolveAI(cfg);
   const base = String(ai.base || "").replace(/\/+$/, "");
   const model = String(ai.model || "");
-  const isLocalProvider = (cfg && cfg.aiPreset === "ollama") || isLocalAIBase(base);
   if (!base || !model) {
     return { error: "请先配置 AI 服务商和模型" };
   }
-  // 发送密钥前先校验端点协议/主机；校验失败立即停止，密钥不发送
-  const endpointError = validateAIEndpoint(base);
-  if (endpointError) {
-    folium.log.warn("aiLookup blocked: " + endpointError + " base=" + base);
-    return { error: endpointError + "；请修正「接口地址（自定义）」后重试" };
+  // 发送密钥前先解析并校验端点协议/主机；校验失败立即停止，密钥不发送
+  const endpointResult = parseAIEndpoint(base);
+  if (endpointResult.error) {
+    folium.log.warn("aiLookup blocked: " + endpointResult.error);
+    return { error: endpointResult.error + "；请修正「接口地址（自定义）」后重试" };
   }
+  const endpoint = endpointResult.url;
+  const isLocalProvider = cfg.aiPreset === "ollama" || endpointResult.isLocal;
   if (!cfg.apiKey && !isLocalProvider) {
     return { error: "请先配置 AI 服务商和模型，并在「AI API 密钥」设置中保存密钥" };
   }
@@ -482,7 +498,6 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
   const keepTxt = effKeep
     ? "任何部分不是" + langName + "时（如繁体、英文、日文、粤语等），一律保留原文，并在原文下方另起一行附上" + langName + "翻译，格式为\"原文\"后换行\"（翻译：……）\"，逐条对应；"
     : "将内容统一翻译成" + langName + "，不保留原文；";
-  const endpoint = /\/chat\/completions$/.test(base) ? base : base + "/chat/completions";
   let sys = hasCtx
     ? "你是音乐资料助手。下面提供【检索资料】片段（来自豆瓣音乐/萌娘百科/维基百科/百度百科，可能不完整或为空）。" +
       "回答规则：① 翻译规则是最重要的硬性要求：" + keepTxt +
@@ -852,8 +867,9 @@ export default function activate(folium) {
     for (const def of settingsSchema) d[def.key] = def.defaultValue;
     return d;
   })();
-  // 加载以持久化配置为准：仅当加载期间确实发生用户修改（settingsDirty）时，才把这些修改合并进去。
-  // 不再用「settingsMem 是否有键」判断用户是否改过设置（getCfg 的默认值副本不应被当成用户修改）。
+  // 加载以持久化配置为准：仅把加载期间用户实际改动的键（pendingSettings）合并进去，
+  // 内存默认值不会覆盖其他已保存设置。
+  let pendingSettings = {};
   const ensureSettingsLoaded = () => {
     if (!settingsLoadPromise) {
       settingsLoadPromise = (async () => {
@@ -863,12 +879,12 @@ export default function activate(folium) {
           settingsMem = {
             ...DEFAULT_SETTINGS,
             ...stored,
-            ...(settingsDirty && settingsMem ? settingsMem : {}),
+            ...pendingSettings,
           };
         } catch (_) {
           settingsMem = {
             ...DEFAULT_SETTINGS,
-            ...(settingsDirty && settingsMem ? settingsMem : {}),
+            ...pendingSettings,
           };
         }
       })();
@@ -876,17 +892,27 @@ export default function activate(folium) {
     return settingsLoadPromise;
   };
   const getCfg = () => (settingsMem ? settingsMem : { ...DEFAULT_SETTINGS });
-  // 保存串行化：连续写入按顺序落盘，后写的永远最后完成，避免旧写入覆盖新值
+  // 保存串行化：连续写入按顺序落盘，后写的永远最后完成，避免旧写入覆盖新值；
+  // 支持一次提交多个改动（传对象 patch）
   let settingsWriteChain = Promise.resolve();
-  const writeCfg = (key, value) => {
+  const writeCfg = (keyOrPatch, value) => {
+    const patch = typeof keyOrPatch === "string"
+      ? { [keyOrPatch]: value }
+      : keyOrPatch;
+    Object.assign(pendingSettings, patch);
     settingsDirty = true;
-    const next = { ...getCfg(), [key]: value };
-    settingsMem = next;
+    settingsMem = { ...getCfg(), ...patch };
     settingsWriteChain = settingsWriteChain
       .then(() => ensureSettingsLoaded())
-      .then(() => folium.storage.set(SETTINGS_KEY, settingsMem))
-      .then(() => { settingsDirty = false; })
-      .catch((e) => folium.log.warn("setting save failed: " + key, String((e && e.message) || e)));
+      .then(async () => {
+        settingsMem = { ...settingsMem, ...pendingSettings };
+        await folium.storage.set(SETTINGS_KEY, settingsMem);
+        pendingSettings = {};
+        settingsDirty = false;
+      })
+      .catch((e) => {
+        folium.log.warn("setting save failed", String((e && e.message) || e));
+      });
     return settingsWriteChain;
   };
 
@@ -1101,10 +1127,12 @@ export default function activate(folium) {
             saveStatus.textContent = en ? "No unsaved changes." : "没有需要保存的改动。";
             return;
           }
-          for (const k of keys) writeCfg(k, pending[k]);
+          const patch = { ...pending };
           pending = {};
-          refresh();
-          saveStatus.textContent = en ? "Saved — changes are now active." : "已保存，改动已生效。";
+          writeCfg(patch).then(() => {
+            refresh();
+            saveStatus.textContent = en ? "Saved — changes are now active." : "已保存，改动已生效。";
+          });
         });
         saveRow.append(saveBtn, saveStatus);
         // 详细说明：以统一文段介绍模组基本行为（不采用版本更新记录格式）
@@ -1244,6 +1272,7 @@ export default function activate(folium) {
   let preloadLastKey = "";
   const preloadNextTrack = async () => {
     try {
+      await ensureSettingsLoaded();
       const cfg = getCfg();
       if (!cfg.preloadNext || String(cfg.source || "baike") !== "ai") {
         logDiag(folium, "preload skip: preloadNext=" + !!cfg.preloadNext + " source=" + cfg.source);
@@ -1374,6 +1403,7 @@ export default function activate(folium) {
       };
       // 记忆补充统一入口：查询（支持传入并行中的 promise）→ 合并 → 写缓存 → 返回
       const runMemorySupplement = async (artist, title, baseData, memPromise) => {
+        await ensureSettingsLoaded();
         const cfg = getCfg();
         const memResult = memPromise || await lookupAndCache(memoryCfgOf(cfg), artist, title, "ai-memory", false);
         if (!memResult || memResult.error || !memResult.ai) {
@@ -1465,6 +1495,8 @@ export default function activate(folium) {
       };
 
       const render = async (force) => {
+        if (disposed) return;
+        await ensureSettingsLoaded(); // 查询前先等待设置加载完成，未打开设置面板也使用已保存配置
         if (disposed) return;
         const st = folium.playback.getState();
         const song = st && st.song;
@@ -1589,6 +1621,9 @@ export default function activate(folium) {
 
         if (data && data.generatedByAi) {
           html += data.aiAggregated ? '<div class="si-warn">AI 参考了公开检索结果并生成内容，请核对准确性。</div>' : '<div class="si-warn">AI 生成，未经检索；内容可能不准确，请自行核实。</div>';
+        }
+        if (data && data.memorySupplementAdded) {
+          html += '<div class="si-warn">部分内容由 AI 记忆补充，未经检索核实，请自行核对。</div>';
         }
 
         if (!data) {
