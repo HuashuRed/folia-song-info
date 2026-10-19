@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.3.0（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.3.1（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.3.0 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.3.1 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -672,40 +672,53 @@ async function saveCache(folium, cache) {
 
 const truncate = (s, n) => (s.length > n ? s.slice(0, n).replace(/\s+\S*$/, "") + "…" : s);
 
-// 竞速收集：同时发起 jobs（支持函数或 Promise），按完成顺序收集非空结果，集满 wanted 个即停
+// 竞速收集：同时发起 jobs（支持函数或 Promise），按完成顺序收集非空结果，集满 wanted 个即停。
+// 修复：按 idx 定位完成项并从待查列表移除（旧实现用完成值在 promise 数组中 indexOf，永远匹配不到，
+// 全部失败时 wraps 永不减少、done 永不增长，造成公开检索死循环卡死）；另有总时限兜底防个别请求不返回。
 async function collectFast(jobs, wanted) {
-  const wraps = jobs.map((job) => {
-    const p = typeof job === "function" ? job() : Promise.resolve(job);
-    return p.then((r) => ({ r })).catch(() => ({ r: null }));
-  });
+  const pend = jobs.map((job, idx) => ({
+    idx,
+    promise: (typeof job === "function" ? job() : Promise.resolve(job))
+      .then((r) => ({ idx, r: r || null }))
+      .catch(() => ({ idx, r: null })),
+  }));
   const done = [];
-  while (wraps.length && done.length < wanted) {
-    const won = await Promise.race(wraps);
-    const i = wraps.indexOf(won);
-    if (i >= 0) wraps.splice(i, 1);
-    if (won.r) done.push(won.r);
+  let timer = null;
+  const deadlineP = new Promise((resolve) => { timer = setTimeout(() => resolve("__deadline__"), 20000); });
+  try {
+    while (pend.length && done.length < wanted) {
+      const won = await Promise.race([...pend.map((x) => x.promise), deadlineP]);
+      if (won === "__deadline__") break;
+      const i = pend.findIndex((x) => x.idx === won.idx);
+      if (i >= 0) pend.splice(i, 1);
+      if (won.r) done.push(won.r);
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   return done;
 }
 
 // 限时收集：同时发起 jobs（支持函数或 Promise），在 ms 毫秒内按完成顺序收集结果；结束后清理定时器
 async function raceWithDeadline(jobs, ms) {
-  const wraps = jobs.map((job) => {
-    const p = typeof job === "function" ? job() : Promise.resolve(job);
-    return p.then((r) => ({ r: r || "" })).catch(() => ({ r: "" }));
-  });
+  const pend = jobs.map((job, idx) => ({
+    idx,
+    promise: (typeof job === "function" ? job() : Promise.resolve(job))
+      .then((r) => ({ idx, r: r || "" }))
+      .catch(() => ({ idx, r: "" })),
+  }));
   const done = [];
   let timer = null;
   const deadlineP = new Promise((resolve) => {
     timer = setTimeout(() => resolve("__deadline__"), ms);
   });
   try {
-    while (wraps.length) {
-      const won = await Promise.race([...wraps, deadlineP]);
+    while (pend.length) {
+      const won = await Promise.race([...pend.map((x) => x.promise), deadlineP]);
       if (won === "__deadline__") break;
-      const i = wraps.indexOf(won);
+      const i = pend.findIndex((x) => x.idx === won.idx);
       if (i < 0) break;
-      wraps.splice(i, 1);
+      pend.splice(i, 1);
       if (won.r) done.push(won.r);
     }
   } finally {
@@ -845,14 +858,16 @@ export default function activate(folium) {
         const en = locale.toLowerCase().startsWith("en");
         const labelText = (v) => typeof v === "string" ? v : (v && (v[locale] || v[locale.split("-")[0]] || v["zh-CN"] || v.en)) || "";
         const wrap = document.createElement("div");
-        wrap.style.cssText = "display:flex;flex-direction:column;gap:12px;padding:8px 0;";
+        wrap.style.cssText = "display:flex;flex-direction:column;gap:18px;padding:10px 0;";
         const controls = new Map();
         const getValues = () => getCfg();
-        const writeValue = (key, value) => writeCfg(key, value);
+        // 改动先进入暂存区，点击「保存设置」后才统一写入并生效
+        let pending = {};
+        const setPending = (key, value) => { pending[key] = value; };
 
         // 顶部分组标签：公开检索 / AI 检索（类似浏览器标签，点击即切换数据源）
         const tabs = document.createElement("div");
-        tabs.style.cssText = "display:flex;gap:6px;margin-bottom:2px;";
+        tabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px;";
         const switchTab = (src) => {
           const isPublic = String(src || "baike") === "baike";
           groupPublic.style.display = isPublic ? "" : "none";
@@ -866,8 +881,8 @@ export default function activate(folium) {
           const t = document.createElement("button");
           t.type = "button";
           t.textContent = text;
-          t.style.cssText = "flex:1;padding:8px 10px;font-size:13px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:transparent;color:inherit;cursor:pointer;";
-          t.addEventListener("click", () => { writeValue("source", key); switchTab(key); });
+          t.style.cssText = "flex:1;padding:10px 12px;font-size:13px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:transparent;color:inherit;cursor:pointer;";
+          t.addEventListener("click", () => { setPending("source", key); switchTab(key); });
           return t;
         };
         const tabPublic = makeTab("baike", en ? "Public search" : "公开检索");
@@ -877,11 +892,20 @@ export default function activate(folium) {
 
         // 分组容器：公开检索 / AI 检索 独有项 + 两 tab 共通的底部公共区
         const groupPublic = document.createElement("div");
-        groupPublic.style.cssText = "display:flex;flex-direction:column;gap:12px;";
+        groupPublic.style.cssText = "display:flex;flex-direction:column;gap:16px;";
         const groupAI = document.createElement("div");
-        groupAI.style.cssText = "display:flex;flex-direction:column;gap:12px;";
+        groupAI.style.cssText = "display:flex;flex-direction:column;gap:16px;";
         const groupCommon = document.createElement("div");
-        groupCommon.style.cssText = "display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:12px;";
+        groupCommon.style.cssText = "display:flex;flex-direction:column;gap:16px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:16px;";
+        const groupTitle = (t) => {
+          const d = document.createElement("div");
+          d.textContent = t;
+          d.style.cssText = "font-size:13px;font-weight:700;margin:0;";
+          return d;
+        };
+        groupPublic.appendChild(groupTitle(en ? "Public search settings" : "公开检索设置"));
+        groupAI.appendChild(groupTitle(en ? "AI search settings" : "AI 检索设置"));
+        groupCommon.appendChild(groupTitle(en ? "Common settings (both modes)" : "通用设置（两种模式共用）"));
         // AI 检索固定使用「详细」挡位：不再提供内容长度选项（简洁/标准已移除）
         const PUBLIC_KEYS = ["contentDetail", "keepOriginal"];
         const AI_KEYS = ["aiPreset", "aiBaseUrl", "aiModel", "aiTemperature", "preloadNext", "autoAiMemorySupplement"];
@@ -891,7 +915,7 @@ export default function activate(folium) {
         for (const def of settingsSchema) {
           if (def.key === "source") continue; // 数据源由顶部标签代替
           const row = document.createElement("label");
-          row.style.cssText = "display:flex;flex-direction:column;gap:5px;font-size:13px;color:inherit;";
+          row.style.cssText = "display:flex;flex-direction:column;gap:8px;font-size:13px;color:inherit;";
           const title = document.createElement("span");
           title.textContent = labelText(def.label);
           const hoverHelp = ["preloadNext", "keepOriginal", "useMyMemory", "autoAiMemorySupplement"].includes(def.key);
@@ -921,14 +945,16 @@ export default function activate(folium) {
               option.style.backgroundColor = "var(--folium-background, var(--folium-surface, Canvas))";
               input.appendChild(option);
             }
-            input.addEventListener("change", () => writeValue(def.key, input.value));
+            input.addEventListener("change", () => setPending(def.key, input.value));
           } else if (def.type === "boolean") {
             input = document.createElement("input");
             input.type = "checkbox";
-            input.addEventListener("change", () => writeValue(def.key, input.checked));
+            input.addEventListener("change", () => setPending(def.key, input.checked));
             row.style.flexDirection = "row";
             row.style.alignItems = "center";
-            row.style.gap = "9px";
+            row.style.gap = "10px";
+            input.style.width = "16px";
+            input.style.height = "16px";
             row.insertBefore(input, title);
             title.style.order = "1";
           } else {
@@ -938,10 +964,10 @@ export default function activate(folium) {
             if (def.min != null) input.min = String(def.min);
             if (def.max != null) input.max = String(def.max);
             if (def.step != null) input.step = String(def.step);
-            input.style.cssText = "box-sizing:border-box;width:100%;padding:7px 9px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:7px;background:var(--folium-background,var(--folium-surface,transparent));color:inherit;color-scheme:inherit;";
+            input.style.cssText = "box-sizing:border-box;width:100%;padding:10px 12px;border:1px solid var(--folium-border,rgba(128,128,128,.35));border-radius:8px;background:var(--folium-background,var(--folium-surface,transparent));color:inherit;color-scheme:inherit;";
             const commit = () => {
               const value = def.type === "number" ? Number(input.value) : input.value;
-              if (def.type !== "number" || input.value.trim() !== "") writeValue(def.key, value);
+              if (def.type !== "number" || input.value.trim() !== "") setPending(def.key, value);
             };
             input.addEventListener("change", commit);
             input.addEventListener("blur", commit);
@@ -1010,7 +1036,29 @@ export default function activate(folium) {
         aiFixedNote.textContent = en ? "AI lookup always uses the Detailed level; the content-length option applies to public search only." : "AI 检索固定使用「详细」挡位；内容长度选项仅用于公开检索。";
         aiFixedNote.style.cssText = "opacity:.65;line-height:1.4;";
         groupAI.appendChild(aiFixedNote);
-        wrap.append(groupPublic, groupAI, groupCommon);
+        // 保存设置：统一写入暂存的全部改动后生效（API 密钥仍即时保存）
+        const saveRow = document.createElement("div");
+        saveRow.style.cssText = "display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:16px;";
+        const saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.textContent = en ? "Save settings" : "保存设置";
+        saveBtn.style.cssText = "padding:10px 20px;border:1px solid rgba(139,92,246,.55);background:rgba(139,92,246,.16);color:inherit;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;";
+        const saveStatus = document.createElement("div");
+        saveStatus.style.cssText = "font-size:12px;opacity:.72;";
+        saveStatus.textContent = en ? "Changes apply only after you click Save." : "改动仅在点击「保存设置」后生效。";
+        saveBtn.addEventListener("click", () => {
+          const keys = Object.keys(pending);
+          if (!keys.length) {
+            saveStatus.textContent = en ? "No unsaved changes." : "没有需要保存的改动。";
+            return;
+          }
+          for (const k of keys) writeCfg(k, pending[k]);
+          pending = {};
+          refresh();
+          saveStatus.textContent = en ? "Saved — changes are now active." : "已保存，改动已生效。";
+        });
+        saveRow.append(saveBtn, saveStatus);
+        wrap.append(groupPublic, groupAI, groupCommon, saveRow);
         container.appendChild(wrap);
 
         const refresh = () => {
