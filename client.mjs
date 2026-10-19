@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.3.2（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.3.3（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.3.2 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.3.3 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -894,7 +894,7 @@ export default function activate(folium) {
         const groupPublic = document.createElement("div");
         groupPublic.style.cssText = "display:flex;flex-direction:column;gap:26px;";
         const groupAI = document.createElement("div");
-        groupAI.style.cssText = "display:flex;flex-direction:column;gap:26px;";
+        groupAI.style.cssText = "display:flex;flex-direction:column;gap:32px;";
         const groupCommon = document.createElement("div");
         groupCommon.style.cssText = "display:flex;flex-direction:column;gap:26px;border-top:1px solid var(--folium-border,rgba(128,128,128,.25));padding-top:22px;";
         const groupTitle = (t) => {
@@ -915,7 +915,7 @@ export default function activate(folium) {
         for (const def of settingsSchema) {
           if (def.key === "source") continue; // 数据源由顶部标签代替
           const row = document.createElement("label");
-          row.style.cssText = "display:flex;flex-direction:column;gap:12px;font-size:13px;color:inherit;";
+          row.style.cssText = "display:flex;flex-direction:column;gap:14px;font-size:13px;color:inherit;";
           const title = document.createElement("span");
           title.textContent = labelText(def.label);
           const hoverHelp = ["preloadNext", "keepOriginal", "useMyMemory", "autoAiMemorySupplement"].includes(def.key);
@@ -978,7 +978,7 @@ export default function activate(folium) {
         }
         const keyTitle = document.createElement("div");
         keyTitle.textContent = en ? "AI API key (stored locally)" : "AI API 密钥（本机保存）";
-        keyTitle.style.cssText = "font-size:13px;font-weight:600;margin-top:14px;";
+        keyTitle.style.cssText = "font-size:13px;font-weight:600;margin-top:20px;";
         groupAI.appendChild(keyTitle);
         const keyHelp = document.createElement("small");
         keyHelp.textContent = en ? "Not included in visual-config exports. Local storage is not an OS-encrypted keychain." : "密钥不会写入视觉配置导出；本地存储并非操作系统加密密钥库。";
