@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.3.3（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.4.0（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.3.3 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.4.0 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -794,7 +794,7 @@ export default function activate(folium) {
     { key: "showCredits", type: "boolean", label: { "zh-CN": "显示创作人员", en: "Show credits" }, defaultValue: true },
     { key: "showListeningNotes", type: "boolean", label: { "zh-CN": "显示聆听提示（AI 解读）", en: "Show listening notes (AI interpretation)" }, defaultValue: true },
     { key: "showArtistDetails", type: "boolean", label: { "zh-CN": "显示歌手经历与荣誉", en: "Show artist career and honors" }, defaultValue: true },
-    { key: "autoAiMemorySupplement", type: "boolean", label: { "zh-CN": "自动 AI 记忆补充", en: "Auto AI memory supplement" }, description: { "zh-CN": "开启后，AI 查询结果若缺少歌曲/歌手栏目，会自动调用 AI 记忆补充并缓存结果，无需手动点击；补充内容来自模型自身知识、未经检索核实（说明见模组介绍），可能增加 AI 调用次数和费用。", en: "When enabled, missing song/artist sections trigger an AI-memory completion and cache automatically. Supplemented text comes from the model's own knowledge (unverified); may incur extra AI usage costs." }, defaultValue: false },
+    { key: "autoAiMemorySupplement", type: "boolean", label: { "zh-CN": "自动 AI 记忆补充", en: "Auto AI memory supplement" }, description: { "zh-CN": "开启后，当抓取到的栏目不齐全或信息过少时自动调用 AI 记忆补充并刷新缓存；栏目齐全且信息充足时不自动触发（此时可手动点击「AI 记忆补充」刷新）。切换到其他标签页再切回时也会自动复查一次。补充内容来自模型自身知识、未经检索核实（说明见模组介绍），可能增加 AI 调用次数和费用。", en: "When enabled, missing sections or too-little content trigger an AI-memory completion automatically; complete data is left untouched until you click the button. Switching away and back also re-checks once. Supplemented text comes from the model's own knowledge (unverified); may incur extra AI usage costs." }, defaultValue: false },
     { key: "preloadNext", type: "boolean", label: { "zh-CN": "预加载播放列表下一首（AI 检索）", en: "Preload next playlist track (AI lookup)" }, description: { "zh-CN": "开启后，歌曲切换时会尝试提前查询下一首歌曲并缓存结果；仅在数据源为 AI 检索且能从播放状态识别下一首时生效，可能提前向 AI 服务商发送歌曲信息并产生费用。", en: "When enabled, attempts to fetch and cache the next playlist track when the song changes. Only works for AI lookup when the next track can be identified; may send track details to your AI provider and incur costs." }, defaultValue: false },
     { key: "keepOriginal", type: "boolean", label: { "zh-CN": "保留原文", en: "Keep original" }, description: { "zh-CN": "开启时同时显示原文与译文；关闭时只显示译文。仅作用于公开检索到的真实资料；AI 检索始终只显示软件使用语言，此开关在 AI 检索模式下不可用。", en: "Show source text alongside translation for public-lookup results only. AI lookup always shows only the UI language; this switch is disabled in AI mode." }, defaultValue: true },
     { key: "useMyMemory", type: "boolean", label: { "zh-CN": "启用 MyMemory 在线翻译（会发送资料文本）", en: "Enable MyMemory translation (sends source text)" }, description: { "zh-CN": "默认关闭。开启后，非简繁转换的资料文本最多 1800 字会发送至 MyMemory。", en: "Off by default. Up to 1,800 characters may be sent to MyMemory." }, defaultValue: false },
@@ -1236,12 +1236,28 @@ export default function activate(folium) {
       let curCacheKey = null;
       let disposed = false;
 
-      const missingSections = (data) => {
+      // 自动 AI 记忆补充的触发判定：
+      // 1) 7 个栏目（作曲作词、歌手简介、歌手代表作、歌手经历、创作与发行背景、歌曲出处、聆听解读）不齐全 → 自动补充
+      // 2) 栏目齐全但内容总量过少（总字符 < 120）→ 自动补充
+      // 3) 栏目齐全且内容充足 → 不自动触发，仅用户点击「AI 记忆补充」时刷新
+      const needsAutoSupplement = (data) => {
         if (!data || !data.ai) return false;
-        const a = data.ai, s = a.song || {}, ar = a.artist || {};
-        return ![s.writers, s.composers, s.arranger].some((v) => String(v || "").trim()) ||
-          !String(ar.bio || "").trim() || !String(ar.representativeWorks || "").trim() || !String(ar.career || "").trim() ||
-          !String(s.origin || "").trim() || !String(s.source || "").trim() || !String(s.listeningNotes || "").trim();
+        const a = data.ai;
+        const s = a.song || {}, ar = a.artist || {};
+        const credits = [s.writers, s.composers, s.arranger].map((v) => String(v || "").trim()).filter(Boolean).join("；");
+        const vals = [
+          credits,
+          String(ar.bio || "").trim(),
+          String(ar.representativeWorks || "").trim(),
+          String(ar.career || "").trim(),
+          String(s.origin || "").trim(),
+          String(s.source || "").trim(),
+          String(s.listeningNotes || "").trim(),
+        ];
+        const filled = vals.filter((v) => v.length > 0).length;
+        if (filled < 7) return true; // 栏目不齐全
+        const total = vals.reduce((n, v) => n + v.length, 0);
+        return total < 120; // 栏目齐全但信息过少
       };
       const memoryCfgOf = (cfg) => ({ ...(cfg || {}), source: "ai", aiMemoryOnly: true, contentDetail: "detailed" });
       // 统一的记忆补充合并：AI 记忆补充与 AI 生成来自同一个 AI 接口，此处只保留一份合并逻辑
@@ -1341,6 +1357,20 @@ export default function activate(folium) {
         }
       };
 
+      // 缓存数据触发自动补充（栏目不齐全或信息过少时），渲染与标签页切回共用
+      const autoSupplement = async (song, key, hit) => {
+        if (disposed || curKey !== key || !hit || !hit.data || hit.data.error) return false;
+        if (!(getCfg().autoAiMemorySupplement && needsAutoSupplement(hit.data))) return false;
+        applyContent('<div class="si-load">正在自动补充资料…</div>');
+        logDiag(folium, "auto supplement: data needs supplement -> run for " + (song.artist || "") + " - " + song.title);
+        const mem = await runMemorySupplement(song.artist || "", song.title, hit.data);
+        if (disposed || curKey !== key) return true;
+        logDiag(folium, "auto supplement done: ok=" + mem.ok + (mem.error ? " err=" + mem.error : ""));
+        applyContent(renderCard(song, mem.ok ? mem.data : hit.data, "ai", true));
+        bindRegen(); bindMemorySupplement();
+        return true;
+      };
+
       const render = async (force) => {
         if (disposed) return;
         const st = folium.playback.getState();
@@ -1370,31 +1400,20 @@ export default function activate(folium) {
         const usefulCachedData = hit && hit.data && !hit.data.error &&
           (hit.data.ai || hit.data.artistIntro || hit.data.songIntro || (hit.data.mb && (hit.data.mb.album || hit.data.mb.year || hit.data.mb.releaseDate)));
         if (!force && usefulCachedData && Date.now() - hit.ts < CACHE_TTL) {
-          if (autoEnabled && missingSections(hit.data)) {
-            applyContent('<div class="si-load">正在自动补充资料…</div>');
-            logDiag(folium, "auto supplement: cache-hit missing sections -> run for " + artist + " - " + title);
-            const mem = await runMemorySupplement(artist, title, hit.data);
-            if (disposed || curKey !== key) return;
-            logDiag(folium, "auto supplement done: ok=" + mem.ok + (mem.error ? " err=" + mem.error : ""));
-            applyContent(renderCard(song, mem.ok ? mem.data : hit.data, cfg.source || "ai", true));
-            bindRegen(); bindMemorySupplement();
-            return;
-          }
+          if (await autoSupplement(song, key, hit)) return;
           applyContent(renderCard(song, hit.data, hit.source || cfg.source || "baike", true));
           bindRegen(); bindMemorySupplement();
           return;
         }
 
         applyContent('<div class="si-load">正在查询资料…</div>');
-        // 主查询与自动记忆补充并行发起（记忆补充复用同一 AI 接口，无冗余链路）
-        const dataP = lookupAndCache(cfg, artist, title, cfg.source || "baike", !!force);
-        const memP = autoEnabled ? lookupAndCache(memoryCfgOf(cfg), artist, title, "ai-memory", false) : null;
-        const data = await dataP;
+        // 主查询完成后按触发条件判定：栏目不齐全或信息过少才发起记忆补充（信息充足时不自动调用 AI）
+        const data = await lookupAndCache(cfg, artist, title, cfg.source || "baike", !!force);
         if (disposed || curKey !== key) return;
         let finalData = data;
-        if (autoEnabled && data && data.ai) {
-          logDiag(folium, "auto supplement: parallel with main lookup for " + artist + " - " + title);
-          const mem = await runMemorySupplement(artist, title, data, memP);
+        if (autoEnabled && data && data.ai && needsAutoSupplement(data)) {
+          logDiag(folium, "auto supplement: needs supplement -> run for " + artist + " - " + title);
+          const mem = await runMemorySupplement(artist, title, data);
           if (disposed || curKey !== key) return;
           if (mem.ok) {
             finalData = mem.data;
@@ -1556,9 +1575,31 @@ export default function activate(folium) {
         render();
       });
 
+      // 标签页切回检测：面板从隐藏变为可见时，若自动补充开启且当前数据需要补充，则自动刷新一次
+      let panelWasVisible = root.offsetWidth > 0 || root.offsetHeight > 0 || root.getClientRects().length > 0;
+      const visTimer = setInterval(() => {
+        if (disposed) return;
+        const vis = root.offsetWidth > 0 || root.offsetHeight > 0 || root.getClientRects().length > 0;
+        if (vis && !panelWasVisible) {
+          panelWasVisible = true;
+          (async () => {
+            const st = folium.playback.getState();
+            const song = st && st.song;
+            if (!song || !song.title) return;
+            const key = [song.id || "", song.artist || "", song.title || ""].join("\u0001");
+            if (curKey !== key) return;
+            const cache = await loadCache(folium);
+            if (curCacheKey && cache[curCacheKey]) await autoSupplement(song, key, cache[curCacheKey]);
+          })();
+        } else if (!vis) {
+          panelWasVisible = false;
+        }
+      }, 1500);
+
       return () => {
         disposed = true;
         if (animTimer) { clearTimeout(animTimer); animTimer = null; }
+        clearInterval(visTimer);
         off();
         lastPanelH = root.offsetHeight || container.offsetHeight || lastPanelH;
         root.remove();
