@@ -1,4 +1,4 @@
-// song-info/client.mjs — 歌曲资料 v2.5.1（多源检索与 AI 解析修复版）
+// song-info/client.mjs — 歌曲资料 v2.5.3（多源检索与 AI 解析修复版）
 // 播放页进度条右侧信息按钮 → 打开「歌曲资料」面板页签。
 // 数据源（在模组管理设置中选择）：
 //   默认「公开检索」：并发检索公开来源，按完成速度采用有效结果
@@ -16,7 +16,7 @@ const CACHE_KEY = "si-cache-v2";
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 仅成功结果缓存 30 天
 const API_KEY_STORAGE = "si-api-key";
 const CACHE_MAX_BYTES = 420 * 1024; // 为宿主 1 MB storage 留出余量
-const MB_USER_AGENT = "Folium-SongInfo/2.5.1 (https://github.com/folium-mods/song-info)";
+const MB_USER_AGENT = "Folium-SongInfo/2.5.3 (https://github.com/folium-mods/song-info)";
 
 // 网络请求：不伪装浏览器 UA/Referer（使用宿主默认真实请求头），同源限流防止高频抓取导致 IP 被封。
 const RATE_MS = 600;
@@ -30,6 +30,8 @@ function limitedFetch(folium, url, options) {
   const last = lastReqAt.get(host) || 0;
   const wait = Math.max(0, last + RATE_MS - now);
   lastReqAt.set(host, now + wait);
+  // 防止 map 无限增长（来源主机有限，但长期运行仍做上限保护，按插入顺序淘汰最旧项）
+  if (lastReqAt.size > 64) { const oldest = lastReqAt.keys().next().value; lastReqAt.delete(oldest); }
   if (wait > 0) {
     return new Promise((resolve) => setTimeout(resolve, wait)).then(() => folium.net.fetch(url, opts));
   }
@@ -137,6 +139,7 @@ function isTargetLang(text, target) {
   if (target === "ko") return hasHangul && !hasHan && !hasKana;
   if (target === "zh-TW") return hasHan && hasTrad(t) && !hasKana && !hasHangul;
   if (target === "zh-CN") return hasHan && !hasTrad(t) && !hasKana && !hasHangul && !/[A-Za-z]{3,}/.test(t);
+  // 注意：en 与 id 同为拉丁字母，无法靠字符集区分；目标为 id 时英文文本会被误判为已是目标语言。
   if (target === "id") return !hasHan && !hasKana && !hasHangul;
   return false;
 }
@@ -155,27 +158,15 @@ function detectSrc(text) {
   return "zh-CN";
 }
 
-// 公开检索模式的翻译
-async function translateForPublic(folium, text, target, keepOriginal, allowRemoteTranslation) {
-  const orig = String(text || "").trim();
-  if (!orig) return orig;
-  const tgt = normTarget(target);
-  if (isTargetLang(orig, tgt)) return orig;
-
-  // zh-CN 目标 + 繁体中文源（无日文假名）→ 离线简繁转换（仅当确有转换）
-  if (tgt === "zh-CN" && hasTrad(orig) && !/[\u3040-\u30ff]/.test(orig)) {
-    const t2s = tw2s(orig);
-    if (t2s !== orig) return keepOriginal ? orig + "\n（简体翻译：" + t2s + "）" : t2s;
-  }
-
-  // 其他语言翻译默认关闭；开启后最多发送 1800 字原文到 MyMemory。
-  const src = detectSrc(orig);
-  if (src === tgt || allowRemoteTranslation !== true) return orig;
+// 单段 MyMemory 翻译：返回译文或 null（失败）。
+async function remoteTranslateOne(folium, text, tgt) {
+  const src = detectSrc(text);
+  if (src === tgt) return null;
   const pair = src + "|" + tgt;
   try {
     const r = await limitedFetch(
       folium,
-      "https://api.mymemory.translated.net/get?q=" + enc(orig.slice(0, 1800)) + "&langpair=" + enc(pair),
+      "https://api.mymemory.translated.net/get?q=" + enc(String(text || "").slice(0, 1800)) + "&langpair=" + enc(pair),
       { timeoutMs: 12000 }
     );
     if (r.ok) {
@@ -183,18 +174,71 @@ async function translateForPublic(folium, text, target, keepOriginal, allowRemot
       const statusOk = j.responseStatus == null || Number(j.responseStatus) === 200;
       const tr = statusOk && j.responseData && j.responseData.translatedText;
       if (tr && String(tr).trim() && !/MYMEMORY WARNING|PLEASE SELECT|INVALID LANGUAGE/i.test(String(tr))) {
-        return keepOriginal ? orig + "\n（翻译：" + unent(String(tr)) + "）" : unent(String(tr));
+        return unent(String(tr));
       }
     }
   } catch (e) {
     folium.log.warn("translate failed", String((e && e.message) || e));
   }
+  return null;
+}
 
-  // 失败回退：zh-CN 目标时至少离线转简体（确有转换），否则显示原文
-  if (tgt === "zh-CN") {
-    const t2s = tw2s(orig);
-    if (t2s !== orig) return keepOriginal ? orig + "\n（简体翻译：" + t2s + "）" : t2s;
+// 把文本按「外文串 / 其余」切段：外文串指假名/谚文连续串，或由拉丁字母开头、至少 3 个字符的
+// 字母数字与常见符号串；其余（汉字、中文标点、数字、空白）归保留段。用于混排文本只翻译外文部分。
+function splitForeignRuns(text) {
+  const segments = [];
+  const re = /[\u3040-\u30ff\uac00-\ud7af]+|[A-Za-z][A-Za-z0-9 '’&\-–—.,;:!?()]{2,}/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) segments.push({ text: text.slice(last, m.index), foreign: false });
+    segments.push({ text: m[0], foreign: true });
+    last = m.index + m[0].length;
   }
+  if (last < text.length) segments.push({ text: text.slice(last), foreign: false });
+  return segments;
+}
+
+// 公开检索模式的翻译
+async function translateForPublic(folium, text, target, keepOriginal, allowRemoteTranslation) {
+  const orig = String(text || "").trim();
+  if (!orig) return orig;
+  const tgt = normTarget(target);
+  if (isTargetLang(orig, tgt)) return orig;
+
+  // 离线简繁转换（zh-CN 目标、无假名）：先把繁体转简体，外文保持不变。
+  const canT2S = tgt === "zh-CN" && !/[\u3040-\u30ff]/.test(orig);
+  const simplified = canT2S ? tw2s(orig) : orig;
+  const didT2S = simplified !== orig;
+
+  // 是否有外文片段需要远程翻译
+  const segments = splitForeignRuns(simplified);
+  const hasForeign = segments.some((s) => s.foreign);
+
+  // 没有外文片段：只可能做了简繁转换。
+  if (!hasForeign) {
+    if (didT2S) return keepOriginal ? orig + "\n（简体翻译：" + simplified + "）" : simplified;
+    return orig;
+  }
+
+  // 有外文片段但未开启远程翻译：退回（能简繁转换的部分仍做简繁转换，外文保留原文）。
+  if (allowRemoteTranslation !== true) {
+    if (didT2S) return keepOriginal ? orig + "\n（简体翻译：" + simplified + "）" : simplified;
+    return orig;
+  }
+
+  // 开启远程翻译：逐段翻译外文片段、中文部分保持不动，再拼回。
+  const parts = [];
+  for (const seg of segments) {
+    if (!seg.foreign) { parts.push(seg.text); continue; }
+    const tr = await remoteTranslateOne(folium, seg.text, tgt);
+    parts.push(tr || seg.text);
+  }
+  const out = parts.join("");
+  if (out && out !== simplified) return keepOriginal ? orig + "\n（翻译：" + out + "）" : out;
+
+  // 外文段全部翻译失败：退回（至少有简繁转换）。
+  if (didT2S) return keepOriginal ? orig + "\n（简体翻译：" + simplified + "）" : simplified;
   return orig;
 }
 
@@ -432,38 +476,23 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
     return { error: "请先配置 AI 服务商和模型，并在「AI API 密钥」设置中保存密钥" };
   }
 
-  // ---- RAG：按简洁/标准/详细挡位控制实际来源请求数 ----
+  // ---- RAG：AI 检索固定「详细」挡位，并发检索 5 个公开来源 + MusicBrainz，最多等 6 秒 ----
   let ctx = "";
   let aggregated = false;
-  const detailMode = "detailed"; // AI 检索固定使用详细挡位（2.3.0：不再提供简洁/标准）
   try {
     const parts = [];
-    const allSources = [
-      ["豆瓣音乐", (query) => doubanIntro(folium, query)],
-      ["萌娘百科", (query) => moegirlIntro(folium, query)],
-      ["维基百科（中文）", (query) => wikiIntro(folium, query, WIKI_ZH)],
-      ["维基百科（英文）", (query) => wikiIntro(folium, query, WIKI_EN)],
-      ["百度百科", (query) => baikeIntro(folium, query)],
-    ];
-    if (cfg && cfg.aiMemoryOnly) {
-      ctx = "";
-    } else if (detailMode === "compact") {
-      const query = [title, artist].filter(Boolean).join(" ");
-      if (query) {
-        try {
-          const [name, get] = allSources[0];
-          const value = await get(query);
-          const text = String(value || "").replace(/\s+/g, " ").trim();
-          if (text.length >= 10) parts.push(name + "（关键词：" + query + "）：" + truncate(text, 1000));
-        } catch (_) { /* no second source in compact mode */ }
-      }
-    } else {
-      const sourceCap = detailMode === "detailed" ? 5 : 3;
-      const chosen = allSources.slice(0, sourceCap);
+    if (!(cfg && cfg.aiMemoryOnly)) {
+      const allSources = [
+        ["豆瓣音乐", (query) => doubanIntro(folium, query)],
+        ["萌娘百科", (query) => moegirlIntro(folium, query)],
+        ["维基百科（中文）", (query) => wikiIntro(folium, query, WIKI_ZH)],
+        ["维基百科（英文）", (query) => wikiIntro(folium, query, WIKI_EN)],
+        ["百度百科", (query) => baikeIntro(folium, query)],
+      ];
       const query = [title, artist].filter(Boolean).join(" ");
       const jobs = [];
       if (query) {
-        for (const [name, get] of chosen) {
+        for (const [name, get] of allSources) {
           jobs.push(async () => {
             try {
               const value = await get(query);
@@ -484,7 +513,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       const results = await raceWithDeadline(jobs, 6000);
       for (const result of results) if (result) parts.push(result);
     }
-    ctx = [...new Set(parts)].join("\n\n").slice(0, detailMode === "detailed" ? 20000 : 14000);
+    ctx = [...new Set(parts)].join("\n\n").slice(0, 20000);
     aggregated = !!ctx;
   } catch (e) {
     folium.log.warn("rag fetch failed", String((e && e.message) || e));
@@ -509,16 +538,10 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       "回答规则：① 翻译规则是最重要的硬性要求：" + keepTxt +
       "② 不得把模型记忆描述为检索结果。" +
       (cfg && cfg.aiMemoryOnly ? "记忆补充模式允许凭模型已有记忆生成，内容不要求高准确率，所有生成内容标记为 AI 生成。" : "不得编造发行日期、专辑、创作人员、荣誉或故事背景。") +
-      (detailMode === "detailed" ? "详细挡位允许谨慎使用模型自身知识；将所有此类内容仅写入 memorySupplement 对象以区分来源，不确定的具体事实留空。" : "简洁/标准挡位不允许用模型记忆填补事实字段；没有依据的事实字段必须留空。listeningNotes 可以给出明确标注为主观解读的简短聆听提示。") +
+      "详细挡位允许谨慎使用模型自身知识；将所有此类内容仅写入 memorySupplement 对象以区分来源，不确定的具体事实留空。" +
       "③ 只输出一个 JSON 对象，不要输出其他内容，不要用 markdown 代码块。字段：{song:{album, year, releaseDate, writers, composers, arranger, genre, origin, content, source, listeningNotes}, artist:{name, bio, representativeWorks, honors, career}, memorySupplement:{song:{origin,content,listeningNotes,source,album,year,releaseDate,writers,composers,arranger,genre},artist:{bio,representativeWorks,honors,career}}}。" +
       "正文统一使用" + langName + "。";
-  if (detailMode === "detailed") {
-    sys += "详细挡位规则：先以检索资料为准；若重要字段仍缺失，可谨慎使用模型自身知识补充，但不得猜测。JSON 中额外输出 memorySupplement 对象，结构为 {song:{origin,content,listeningNotes,source,album,year,releaseDate,writers,composers,arranger,genre},artist:{bio,representativeWorks,honors,career}}。只有完全来自模型自身知识、未被检索来源支持的补充写入 memorySupplement 对应字段；这些字段不得重复写入普通 song/artist 字段。不得把 AI 记忆补充列入公开来源。";
-  } else if (detailMode === "compact") {
-    sys += "简洁挡位：输出最关键的基本信息，尽量简短，不进行无来源扩写。";
-  } else {
-    sys += "标准挡位：以多个公开来源交叉汇总为主；没有可靠来源支持的事实留空，不使用模型记忆补全事实。";
-  }
+  sys += "详细挡位规则：先以检索资料为准；若重要字段仍缺失，可谨慎使用模型自身知识补充，但不得猜测。JSON 中额外输出 memorySupplement 对象，结构为 {song:{origin,content,listeningNotes,source,album,year,releaseDate,writers,composers,arranger,genre},artist:{bio,representativeWorks,honors,career}}。只有完全来自模型自身知识、未被检索来源支持的补充写入 memorySupplement 对应字段；这些字段不得重复写入普通 song/artist 字段。不得把 AI 记忆补充列入公开来源。";
   if (cfg && cfg.aiMemoryOnly) {
     sys += "这是【AI 记忆补充】任务，用户明确允许你凭模型自身记忆和常识生成内容，不要求高准确率，不要因为无法核实就留空。请尽可能为以下七个栏目生成有用内容：作曲作词（writers/composers/arranger）、歌手简介（artist.bio）、歌手代表作（artist.representativeWorks）、歌手经历（artist.career）、歌曲创作与发行背景（song.origin）、歌曲出处（song.source）、聆听解读（song.listeningNotes）。可以谨慎使用你对歌曲和歌手的记忆；不要声称这些内容已经检索核实。将生成内容放入 memorySupplement 对应字段，字段包括 song:{writers,composers,arranger,origin,content,source,listeningNotes,album,year,releaseDate,genre}, artist:{bio,representativeWorks,career,honors}。普通 song/artist 字段保持为空。补充内容的来源说明已写入模组介绍；正文与栏目名均不需要添加任何标记。输出完整 JSON。";
   }
@@ -591,7 +614,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
     };
 
     const isMemOnly = !!(cfg && cfg.aiMemoryOnly);
-    if ((detailMode === "detailed" || isMemOnly) && obj && typeof obj === "object") {
+    if (obj && typeof obj === "object") {
       const memory = obj.memorySupplement && typeof obj.memorySupplement === "object" ? obj.memorySupplement : {};
       obj.song = obj.song || {};
       obj.artist = obj.artist || {};
@@ -632,7 +655,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       obj.artist = { name: artistName, bio, representativeWorks, honors, career };
     }
 
-    const sourceMatches = ctx.match(/豆瓣音乐|萌娘百科|维基百科（中文）|维基百科（英文）|维基百科 EN|百度百科|MusicBrainz/g) || [];
+    const sourceMatches = ctx.match(/豆瓣音乐|萌娘百科|维基百科（中文）|维基百科（英文）|百度百科|MusicBrainz/g) || [];
     return { ai: obj, generatedByAi: !hasCtx, aiAggregated: !!hasCtx && aggregated, sources: [...new Set(sourceMatches)] };
   } catch (e) {
     folium.log.warn("aiLookup failed", String((e && e.message) || e));
@@ -728,6 +751,8 @@ const truncate = (s, n) => (s.length > n ? s.slice(0, n).replace(/\s+\S*$/, "") 
 // 竞速收集：同时发起 jobs（支持函数或 Promise），按完成顺序收集非空结果，集满 wanted 个即停。
 // 修复：按 idx 定位完成项并从待查列表移除（旧实现用完成值在 promise 数组中 indexOf，永远匹配不到，
 // 全部失败时 wraps 永不减少、done 永不增长，造成公开检索死循环卡死）；另有总时限兜底防个别请求不返回。
+// 注意：net.fetch 不支持中途取消（FoliumFetchInit 无 signal），达到 wanted 或超时后其余请求仍会在后台
+// 各自跑完（受各自 timeoutMs 约束），此处只停止收集结果，不再等待未完成的请求。
 async function collectFast(jobs, wanted) {
   const pend = jobs.map((job, idx) => ({
     idx,
@@ -860,7 +885,6 @@ export default function activate(folium) {
   // 不再依赖宿主 settings 对象，从根上避免「设置不保存 / 面板改了查询读不到」。
   const SETTINGS_KEY = "si-settings-v2";
   let settingsMem = null;
-  let settingsDirty = false; // 是否有尚未落盘的、由用户（或面板暂存提交）发起的修改
   let settingsLoadPromise = null;
   const DEFAULT_SETTINGS = (() => {
     const d = {};
@@ -900,7 +924,6 @@ export default function activate(folium) {
       ? { [keyOrPatch]: value }
       : keyOrPatch;
     Object.assign(pendingSettings, patch);
-    settingsDirty = true;
     settingsMem = { ...getCfg(), ...patch };
     settingsWriteChain = settingsWriteChain
       .then(() => ensureSettingsLoaded())
@@ -908,7 +931,6 @@ export default function activate(folium) {
         settingsMem = { ...settingsMem, ...pendingSettings };
         await folium.storage.set(SETTINGS_KEY, settingsMem);
         pendingSettings = {};
-        settingsDirty = false;
       })
       .catch((e) => {
         folium.log.warn("setting save failed", String((e && e.message) || e));
@@ -1254,21 +1276,6 @@ export default function activate(folium) {
     return p;
   };
 
-  const findNextSong = (state) => {
-    if (!state || typeof state !== "object") return null;
-    const candidates = [state.nextSong, state.nextTrack, state.next, state.queueNext, state.upNext, state.nextItem, state.nextMedia, state.upNextTrack, state.nextSongData, state.nextTrackData, state.nextPlaybackItem, state.playback?.nextSong, state.playback?.nextTrack, state.playback?.nextItem, state.queue?.next, state.playlist?.next, state.playlist?.nextSong, state.playlist?.nextItem];
-    for (const item of candidates) { if (item && typeof item === "object" && (item.title || item.name)) return item; }
-    const lists = [state.playlist, state.queue, state.upcoming, state.tracks, state.items, state.nextUp, state.playlist?.tracks, state.playlist?.items, state.queue?.tracks, state.queue?.items, state.upcoming?.tracks, state.upcoming?.items, state.playback?.playlist, state.playback?.queue, state.playback?.upcoming];
-    const current = state.song || state.currentSong || state.track || state.currentTrack || state.playback?.song || state.playback?.track || state.currentItem;
-    for (const list of lists) {
-      const arr = Array.isArray(list) ? list : null;
-      if (!arr || !arr.length) continue;
-      let idx = Number.isInteger(state.index) ? state.index : Number.isInteger(state.currentIndex) ? state.currentIndex : Number.isInteger(state.playlistIndex) ? state.playlistIndex : Number.isInteger(state.queueIndex) ? state.queueIndex : Number.isInteger(state.playback?.index) ? state.playback.index : -1;
-      if (idx < 0 && current) idx = arr.findIndex((x) => x && ((current.id != null && x.id === current.id) || (x.title && x.title === current.title && (x.artist || "") === (current.artist || ""))));
-      if (idx >= 0 && idx + 1 < arr.length && arr[idx + 1] && (arr[idx + 1].title || arr[idx + 1].name)) return arr[idx + 1];
-    }
-    return null;
-  };
   let preloadLastKey = "";
   const preloadNextTrack = async () => {
     try {
@@ -1278,11 +1285,13 @@ export default function activate(folium) {
         logDiag(folium, "preload skip: preloadNext=" + !!cfg.preloadNext + " source=" + cfg.source);
         return;
       }
-      const state = folium.playback.getState();
-      const next = findNextSong(state);
-      if (!next) { logDiag(folium, "preload skip: no next song in playback state"); return; }
-      const title = String(next.title || next.name || "").trim();
-      const artist = String(next.artist || next.artistName || "").trim();
+      // 下一首从播放队列读取（getState() 只返回当前歌曲，不含队列/下一首信息）
+      const q = folium.playback.getQueue();
+      if (!q || q.kind === "stage") { logDiag(folium, "preload skip: no queue (stage/external playback)"); return; }
+      const nextItem = q.items.find((it) => it.index === q.currentIndex + 1);
+      if (!nextItem || !nextItem.song) { logDiag(folium, "preload skip: no next song in queue"); return; }
+      const title = String(nextItem.song.title || "").trim();
+      const artist = String(nextItem.song.artist || "").trim();
       if (!title) { logDiag(folium, "preload skip: next song has no title"); return; }
       const key = artist + "\u0001" + title;
       if (key === preloadLastKey) return;
