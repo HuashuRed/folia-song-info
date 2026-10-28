@@ -138,7 +138,13 @@ function isTargetLang(text, target) {
   if (target === "ja") return hasKana && !hasHangul;
   if (target === "ko") return hasHangul && !hasHan && !hasKana;
   if (target === "zh-TW") return hasHan && hasTrad(t) && !hasKana && !hasHangul;
-  if (target === "zh-CN") return hasHan && !hasTrad(t) && !hasKana && !hasHangul && !/[A-Za-z]{3,}/.test(t);
+  if (target === "zh-CN") {
+    if (!hasHan || hasTrad(t) || hasKana || hasHangul) return false;
+    // 汉字为主体即视为中文：专名/术语里的少量拉丁字母不触发整段外文翻译
+    const hanCount = (t.match(/[\u4e00-\u9fff]/g) || []).length;
+    const latinWords = (t.match(/[A-Za-z]{3,}/g) || []).length;
+    return hanCount >= latinWords * 2;
+  }
   // 注意：en 与 id 同为拉丁字母，无法靠字符集区分；目标为 id 时英文文本会被误判为已是目标语言。
   if (target === "id") return !hasHan && !hasKana && !hasHangul;
   return false;
@@ -211,6 +217,15 @@ async function translateForPublic(folium, text, target, keepOriginal, allowRemot
   const simplified = canT2S ? tw2s(orig) : orig;
   const didT2S = simplified !== orig;
 
+  // 目标为繁体而原文是简体：离线表只做繁→简，反向转换不可靠；仅在允许远程翻译时整段送翻，否则保留原文
+  if (tgt === "zh-TW" && !hasTrad(orig) && /[\u4e00-\u9fff]/.test(orig)) {
+    if (allowRemoteTranslation === true) {
+      const tr = await remoteTranslateOne(folium, orig, tgt);
+      if (tr) return keepOriginal ? orig + "\n（繁体翻译：" + tr + "）" : tr;
+    }
+    return orig;
+  }
+
   // 是否有外文片段需要远程翻译
   const segments = splitForeignRuns(simplified);
   const hasForeign = segments.some((s) => s.foreign);
@@ -277,7 +292,8 @@ const parseAIEndpoint = (base) => {
   if (url.username || url.password) {
     return { error: "接口地址不能包含用户名或密码" };
   }
-  const hostname = url.hostname.toLowerCase();
+  // IPv6 主机名在 URL 中带方括号（如 "[::1]"），比较前需去掉，否则 ::1 判定永远不成立
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   const isLocal = hostname === "localhost"
     || hostname === "127.0.0.1"
     || hostname === "::1";
@@ -306,6 +322,9 @@ const toDisplayText = (value) => {
   }
   return "";
 };
+
+// 记忆补充时不得拼接的短字段：年份、日期、专辑名、风格只允许补空缺
+const SHORT_FIELDS = new Set(["year", "releaseDate", "album", "genre"]);
 
 function buildCacheKey(source, artist, title, cfg, locale) {
   const c = cfg || {};
@@ -557,7 +576,7 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
       body: JSON.stringify({
         model: model,
         temperature: cfg && cfg.aiMemoryOnly ? (typeof cfg.aiTemperature === "number" ? cfg.aiTemperature : 0.7) : 0.25,
-        max_tokens: 3000,
+        max_tokens: 4000,
         messages: [
           { role: "system", content: sys },
           { role: "user", content: user },
@@ -571,9 +590,13 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
     const content = Array.isArray(rawContent)
       ? rawContent.map((part) => typeof part === "string" ? part : (part && (part.text || part.content)) || "").join("\n")
       : (typeof rawContent === "string" ? rawContent : "");
+    const finishReason = j && j.choices && j.choices[0] && j.choices[0].finish_reason;
     if (!content.trim()) {
-      const reason = j && j.choices && j.choices[0] && j.choices[0].finish_reason;
-      return { error: "AI 返回了空内容" + (reason ? "（finish_reason: " + reason + "）" : "，请检查模型、配额或接口兼容性") };
+      return { error: "AI 返回了空内容" + (finishReason ? "（finish_reason: " + finishReason + "）" : "，请检查模型、配额或接口兼容性") };
+    }
+    // 输出被长度上限截断时 JSON 必然不完整：直接给出可执行提示，避免误判为模型不兼容
+    if (finishReason === "length") {
+      return { error: "AI 输出达到长度上限被截断，返回的 JSON 不完整。请改用输出上限更大的模型，或把内容长度调为「标准」后重试" };
     }
     const clean = content.replace(/```(?:json|javascript|js)?/gi, "").replace(/```/g, "").trim();
     const first = clean.indexOf("{");
@@ -636,13 +659,13 @@ async function aiLookup(folium, cfg, artist, title, target, keepOriginal) {
     if (obj && typeof obj === "object") {
       const song = obj.song || {};
       const art = obj.artist || {};
-      const [album, writers, composers, arranger, genre, origin, contentField, listeningNotes, sourceField] = await Promise.all([
-        fix(song.album), fix(song.writers), fix(song.composers), fix(song.arranger),
-        fix(song.genre), fix(song.origin), fix(song.content), fix(song.listeningNotes), fix(song.source),
-      ]);
-      const [artistName, bio, representativeWorks, honors, career] = await Promise.all([
-        fix(art.name), fix(art.bio), fix(art.representativeWorks), fix(art.honors), fix(art.career),
-      ]);
+      const [album, writers, composers, arranger, genre, origin, contentField, listeningNotes, sourceField] = await mapLimit([
+        song.album, song.writers, song.composers, song.arranger,
+        song.genre, song.origin, song.content, song.listeningNotes, song.source,
+      ], 2, fix);
+      const [artistName, bio, representativeWorks, honors, career] = await mapLimit([
+        art.name, art.bio, art.representativeWorks, art.honors, art.career,
+      ], 2, fix);
       obj.song = {
         album,
         year: toDisplayText(song.year),
@@ -732,11 +755,16 @@ async function saveCache(folium, cache) {
     const sizeOf = (k) => JSON.stringify(cache[k] || "").length * 3 + k.length * 3;
     let sizeEst = JSON.stringify(cache).length * 3;
     let idx = 0;
-    while (keys.length - idx > 120 || sizeEst > CACHE_MAX_BYTES) {
-      if (idx >= keys.length) break;
+    // 始终保留最近写入的一条：以前删到一条不剩再把空表写回去，表现为缓存突然全丢
+    while ((keys.length - idx > 120 || sizeEst > CACHE_MAX_BYTES) && keys.length - idx > 1) {
       const victim = keys[idx++];
       sizeEst -= sizeOf(victim);
       delete cache[victim];
+    }
+    // 单条就超过上限时放弃本次写入，保住磁盘上已有的旧缓存，而不是用空表覆盖
+    if (sizeEst > CACHE_MAX_BYTES) {
+      folium.log.warn("cache entry exceeds limit, save skipped (kept previous cache)");
+      return false;
     }
     await folium.storage.set(CACHE_KEY, cache);
     return true;
@@ -747,6 +775,33 @@ async function saveCache(folium, cache) {
 }
 
 const truncate = (s, n) => (s.length > n ? s.slice(0, n).replace(/\s+\S*$/, "") + "…" : s);
+
+// 限并发映射：保持结果顺序，避免十几路网络请求同时压向同一翻译接口被限流
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const size = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: size }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  }));
+  return out;
+}
+
+// 缓存写入串行化：loadCache → 修改 → saveCache 必须整体执行，
+// 否则两首并发查询各自读到旧缓存、先后落盘，后写的一方覆盖前者刚写入的条目。
+let cacheWriteChain = Promise.resolve();
+function updateCache(folium, mutate) {
+  const run = cacheWriteChain.then(async () => {
+    const cache = await loadCache(folium);
+    await mutate(cache);
+    return saveCache(folium, cache);
+  });
+  cacheWriteChain = run.then(() => undefined, () => undefined);
+  return run;
+}
 
 // 竞速收集：同时发起 jobs（支持函数或 Promise），按完成顺序收集非空结果，集满 wanted 个即停。
 // 修复：按 idx 定位完成项并从待查列表移除（旧实现用完成值在 promise 数组中 indexOf，永远匹配不到，
@@ -925,17 +980,24 @@ export default function activate(folium) {
       : keyOrPatch;
     Object.assign(pendingSettings, patch);
     settingsMem = { ...getCfg(), ...patch };
-    settingsWriteChain = settingsWriteChain
+    const run = settingsWriteChain
       .then(() => ensureSettingsLoaded())
       .then(async () => {
         settingsMem = { ...settingsMem, ...pendingSettings };
-        await folium.storage.set(SETTINGS_KEY, settingsMem);
-        pendingSettings = {};
-      })
-      .catch((e) => {
-        folium.log.warn("setting save failed", String((e && e.message) || e));
+        const snapshot = { ...pendingSettings };
+        try {
+          await folium.storage.set(SETTINGS_KEY, settingsMem);
+        } catch (e) {
+          // 写入失败：本轮未落盘的键放回待写区，避免用户改动静默丢失
+          Object.assign(pendingSettings, snapshot);
+          throw e;
+        }
+        // 只移除本轮已落盘的键，保存期间产生的新改动继续保留
+        for (const k of Object.keys(snapshot)) delete pendingSettings[k];
       });
-    return settingsWriteChain;
+    // 队列本身不因单次失败中断；失败通过 run 交给调用方
+    settingsWriteChain = run.catch(() => undefined);
+    return run;
   };
 
   try {
@@ -1143,18 +1205,25 @@ export default function activate(folium) {
         const saveStatus = document.createElement("div");
         saveStatus.style.cssText = "font-size:12px;opacity:.72;";
         saveStatus.textContent = en ? "Changes apply only after you click Save." : "改动仅在点击「保存设置」后生效。";
-        saveBtn.addEventListener("click", () => {
+        saveBtn.addEventListener("click", async () => {
           const keys = Object.keys(pending);
           if (!keys.length) {
             saveStatus.textContent = en ? "No unsaved changes." : "没有需要保存的改动。";
             return;
           }
           const patch = { ...pending };
-          pending = {};
-          writeCfg(patch).then(() => {
+          saveBtn.disabled = true;
+          try {
+            await writeCfg(patch);
+            for (const k of Object.keys(patch)) delete pending[k];
             refresh();
             saveStatus.textContent = en ? "Saved — changes are now active." : "已保存，改动已生效。";
-          });
+          } catch (e) {
+            saveStatus.textContent = en ? "Save failed; changes kept for retry." : "保存失败，改动已保留，可再次点击保存。";
+            folium.log.warn("settings save failed", String((e && e.message) || e));
+          } finally {
+            saveBtn.disabled = false;
+          }
         });
         saveRow.append(saveBtn, saveStatus);
         // 详细说明：以统一文段介绍模组基本行为（不采用版本更新记录格式）
@@ -1234,13 +1303,13 @@ export default function activate(folium) {
       try {
         const legacy = await folium.storage.get("si-cache");
         if (legacy && typeof legacy === "object") {
-          const current = await loadCache(folium);
-          for (const [key, entry] of Object.entries(legacy)) {
-            const d = entry && entry.data;
-            const useful = d && !d.error && (d.ai || d.artistIntro || d.songIntro || (d.mb && (d.mb.album || d.mb.year || d.mb.releaseDate)));
-            if (useful && !current[key]) current[key] = entry;
-          }
-          const ok = await saveCache(folium, current);
+          const ok = await updateCache(folium, async (current) => {
+            for (const [key, entry] of Object.entries(legacy)) {
+              const d = entry && entry.data;
+              const useful = d && !d.error && (d.ai || d.artistIntro || d.songIntro || (d.mb && (d.mb.album || d.mb.year || d.mb.releaseDate)));
+              if (useful && !current[key]) current[key] = entry;
+            }
+          });
           if (ok) await folium.storage.delete("si-cache");
         }
       } catch (e) { folium.log.warn("legacy cache migration failed", String((e && e.message) || e)); }
@@ -1261,8 +1330,7 @@ export default function activate(folium) {
       if (effectiveCfg.source === "ai") data = await aiLookup(folium, effectiveCfg, artist, title, curLocale, effectiveCfg.keepOriginal);
       else data = await publicLookup(folium, artist, title, effectiveCfg, curLocale, effectiveCfg.keepOriginal);
       if (data && !data.error) {
-        cache[cacheKey] = { ts: Date.now(), data, source };
-        await saveCache(folium, cache);
+        await updateCache(folium, (c) => { c[cacheKey] = { ts: Date.now(), data, source }; });
       }
       return data;
     })().catch((e) => {
@@ -1401,8 +1469,10 @@ export default function activate(folium) {
             const generated = String(v || "").trim();
             if (!generated) continue;
             const existing = String((dst && dst[k]) || "").trim();
-            if (!existing) dst[k] = generated;
-            else if (!existing.includes(generated)) dst[k] = existing + "\n\n" + generated;
+            if (!existing) { dst[k] = generated; continue; }
+            // 短字段（年份、日期、专辑、风格）只补空缺，不拼接，避免出现「2003\n\n2004」
+            if (SHORT_FIELDS.has(k)) continue;
+            if (!existing.includes(generated)) dst[k] = existing + "\n\n" + generated;
           }
         };
         merge(out.ai.song || (out.ai.song = {}), (memData.ai.song || {}));
@@ -1421,16 +1491,12 @@ export default function activate(folium) {
         const ck = buildCacheKey("ai", artist, title, cfg, curLocale);
         if (!baseData || !baseData.ai) {
           // 当前没有 AI 基础数据：直接以记忆补充结果展示并写入缓存
-          const cache = await loadCache(folium);
-          cache[ck] = { ts: Date.now(), data: memResult, source: "ai" };
-          await saveCache(folium, cache);
+          await updateCache(folium, (cache) => { cache[ck] = { ts: Date.now(), data: memResult, source: "ai" }; });
           return { ok: true, data: memResult };
         }
         const merged = mergeMemoryInto(baseData, memResult);
         if (merged !== baseData && !merged.error) {
-          const cache = await loadCache(folium);
-          cache[ck] = { ts: Date.now(), data: merged, source: "ai" };
-          await saveCache(folium, cache);
+          await updateCache(folium, (cache) => { cache[ck] = { ts: Date.now(), data: merged, source: "ai" }; });
         }
         return { ok: true, data: merged };
       };
@@ -1490,7 +1556,7 @@ export default function activate(folium) {
       };
 
       // 缓存数据触发自动补充（栏目不齐全或信息过少时），渲染与标签页切回共用
-      const autoSupplement = async (song, key, hit) => {
+      const autoSupplement = async (song, key, hit, cacheKey) => {
         if (disposed || curKey !== key || !hit || !hit.data || hit.data.error) return false;
         if (!(getCfg().autoAiMemorySupplement && needsAutoSupplement(hit.data))) return false;
         applyContent('<div class="si-load">正在自动补充资料…</div>');
@@ -1498,6 +1564,10 @@ export default function activate(folium) {
         const mem = await runMemorySupplement(song.artist || "", song.title, hit.data);
         if (disposed || curKey !== key) return true;
         logDiag(folium, "auto supplement done: ok=" + mem.ok + (mem.error ? " err=" + mem.error : ""));
+        // 补充结果必须写回缓存，否则下次打开仍判定「资料不全」，同一首会重复付费查询
+        if (mem.ok && mem.data && cacheKey) {
+          await updateCache(folium, (c) => { c[cacheKey] = { ts: Date.now(), data: mem.data, source: "ai" }; });
+        }
         applyContent(renderCard(song, mem.ok ? mem.data : hit.data, "ai", true));
         bindRegen(); bindMemorySupplement();
         return true;
@@ -1528,13 +1598,15 @@ export default function activate(folium) {
         const autoEnabled = String(cfg.source || "baike") === "ai" && !!(cfg && cfg.autoAiMemorySupplement);
         if (disposed || curKey !== key) return;
 
+        // 先迁移旧版缓存，否则升级后首次渲染读不到已有数据，每首都要白查一遍
+        await migrateLegacyCache();
         const cache = await loadCache(folium);
         if (disposed || curKey !== key) return;
         const hit = cache[cacheKey];
         const usefulCachedData = hit && hit.data && !hit.data.error &&
           (hit.data.ai || hit.data.artistIntro || hit.data.songIntro || (hit.data.mb && (hit.data.mb.album || hit.data.mb.year || hit.data.mb.releaseDate)));
         if (!force && usefulCachedData && Date.now() - hit.ts < CACHE_TTL) {
-          if (await autoSupplement(song, key, hit)) return;
+          if (await autoSupplement(song, key, hit, cacheKey)) return;
           applyContent(renderCard(song, hit.data, hit.source || cfg.source || "baike", true));
           bindRegen(); bindMemorySupplement();
           return;
@@ -1565,11 +1637,8 @@ export default function activate(folium) {
         const b = body.querySelector(".si-regen:not(.si-memory-supplement)");
         if (!b) return;
         b.addEventListener("click", async () => {
-          const cache = await loadCache(folium);
-          if (curCacheKey && cache[curCacheKey]) {
-            delete cache[curCacheKey];
-            await saveCache(folium, cache);
-          }
+          const key = curCacheKey;
+          if (key) await updateCache(folium, (cache) => { delete cache[key]; });
           render(true);
         });
       };
@@ -1726,7 +1795,7 @@ export default function activate(folium) {
             const key = [song.id || "", song.artist || "", song.title || ""].join("\u0001");
             if (curKey !== key) return;
             const cache = await loadCache(folium);
-            if (curCacheKey && cache[curCacheKey]) await autoSupplement(song, key, cache[curCacheKey]);
+            if (curCacheKey && cache[curCacheKey]) await autoSupplement(song, key, cache[curCacheKey], curCacheKey);
           })();
         } else if (!vis) {
           panelWasVisible = false;
